@@ -1,0 +1,58 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+.npm/
+.yarn/
+
+# Build output
+dist/
+build/
+.next/
+.expo/
+coverage/
+TestResults/
+bin/
+obj/
+
+# Local environment
+.env
+.env.*
+!.env.example
+
+# IDE / OS
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Local databases / generated storage
+*.db
+*.sqlite
+*.sqlite3
+data/
+storage/
+
+# Test / tooling caches
+.turbo/
+.cache/
+.parcel-cache/
+.eslintcache
+
+# Secrets / certificates
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Temporary files
+tmp/
+temp/
+*.tmp

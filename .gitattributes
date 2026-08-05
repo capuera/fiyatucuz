@@ -1,0 +1,30 @@
+# Repository-wide text normalization
+* text=auto eol=lf
+
+# Keep common binary assets binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.webp binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.zip binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.otf binary
+
+# GitHub / documentation
+*.md text
+*.yml text
+*.yaml text
+*.json text
+*.ts text
+*.tsx text
+*.js text
+*.jsx text
+*.cs text
+*.csproj text
+*.sln text
+*.sql text
