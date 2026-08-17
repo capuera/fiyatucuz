@@ -1,0 +1,22 @@
+{
+  "expo": {
+    "name": "FiyatUcuz",
+    "slug": "fiyatucuz",
+    "version": "0.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "automatic",
+    "newArchEnabled": true,
+    "scheme": "fiyatucuz",
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.fiyatucuz.app"
+    },
+    "android": {
+      "package": "com.fiyatucuz.app"
+    },
+    "web": {
+      "bundler": "metro"
+    },
+    "plugins": ["expo-router"]
+  }
+}

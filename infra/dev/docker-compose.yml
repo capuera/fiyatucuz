@@ -1,0 +1,40 @@
+# Local development infrastructure for FiyatUcuz.
+# Portable to any Docker host per ADR-0008 (no cloud-specific dependencies).
+
+name: fiyatucuz-dev
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: fiyatucuz-postgres
+    environment:
+      POSTGRES_USER: fiyatucuz
+      POSTGRES_PASSWORD: fiyatucuz
+      POSTGRES_DB: fiyatucuz
+    ports:
+      - '5432:5432'
+    volumes:
+      - fiyatucuz-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U fiyatucuz -d fiyatucuz']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: fiyatucuz-redis
+    command: ['redis-server', '--save', '60', '1', '--loglevel', 'warning']
+    ports:
+      - '6379:6379'
+    volumes:
+      - fiyatucuz-redis-data:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  fiyatucuz-postgres-data:
+  fiyatucuz-redis-data:

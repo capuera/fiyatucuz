@@ -1,0 +1,29 @@
+{
+  "name": "@fiyatucuz/web",
+  "version": "0.0.0",
+  "private": true,
+  "description": "FiyatUcuz public consumer web application (Next.js).",
+  "type": "module",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@fiyatucuz/types": "workspace:*",
+    "@fiyatucuz/validation": "workspace:*",
+    "next": "^15.1.4",
+    "react": "18.3.1",
+    "react-dom": "18.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.5",
+    "@types/react": "18.3.31",
+    "@types/react-dom": "18.3.5",
+    "eslint": "^9.17.0",
+    "eslint-config-next": "^15.1.4",
+    "typescript": "^5.7.2"
+  }
+}

@@ -2,7 +2,7 @@
 
 FiyatUcuz is an AI-native commerce discovery and price comparison platform designed to connect consumers with merchants through product discovery, price intelligence, performance marketing, tracking, analytics, and merchant tooling.
 
-**Repository:** `https://github.com/capuera/fiyatucuzboş`
+**Repository:** `https://github.com/capuera/fiyatucuz`
 
 > The repository is currently in the foundation phase. Product requirements, domain language, architecture decisions, API contracts, and implementation standards will be added incrementally before production modules are developed.
 
@@ -48,21 +48,24 @@ services/      # Independently deployable supporting services when justified
 packages/      # Shared TypeScript libraries
 ```
 
-The backend will be implemented as a .NET application and will be introduced after the initial domain and architecture specifications are established.
+The backend will be implemented as a Node.js + TypeScript application (modular monolith initially) and will be introduced after the initial domain and architecture specifications are established. See [ADR-0001](adr/0001-backend-runtime.md).
 
 ## Planned Technology Direction
 
 ### Backend
-- .NET 10 / ASP.NET Core
-- PostgreSQL
+
+- Node.js (LTS) + TypeScript (strict)
+- Fastify (see [ADR-0001](adr/0001-backend-runtime.md))
+- PostgreSQL via Drizzle ORM (see [ADR-0005](adr/0005-orm-drizzle.md))
 - Redis
-- RabbitMQ
-- OpenSearch
-- SignalR
-- Background job processing
+- Background job abstraction (implementation deferred; see [ADR-0009](adr/0009-jobs-abstraction-first.md))
+- Realtime abstraction (implementation deferred; see [ADR-0010](adr/0010-realtime-abstraction-first.md))
+- OpenSearch-compatible search (adopted when catalog scale requires it)
 - S3-compatible object storage
+- OpenAPI 3.1 as the authoritative API contract; Zod for runtime validation (see [ADR-0006](adr/0006-api-contract-openapi-first.md))
 
 ### Web
+
 - Next.js
 - React
 - TypeScript
@@ -71,6 +74,7 @@ The backend will be implemented as a .NET application and will be introduced aft
 - Zod
 
 ### Mobile
+
 - React Native
 - Expo
 - Expo Router
@@ -79,8 +83,8 @@ The backend will be implemented as a .NET application and will be introduced aft
 - Zod
 
 ### Repository Tooling
-- pnpm
-- Turborepo
+
+- pnpm workspaces (single monorepo; Turborepo intentionally not adopted at this stage, see [ADR-0011](adr/0011-monorepo-pnpm-only.md))
 - GitHub Actions
 - Docker
 
@@ -106,18 +110,18 @@ Technology choices remain subject to the Architecture Decision Record process un
 
 ## Development Status
 
-| Area | Status |
-|---|---|
-| Repository foundation | In progress |
-| Business requirements | Planned |
-| Domain model | Planned |
-| Architecture | Planned |
-| Database specification | Planned |
-| API contracts | Planned |
-| Web application | Planned |
-| Mobile application | Planned |
-| AI capabilities | Planned |
-| Production infrastructure | Planned |
+| Area                      | Status      |
+| ------------------------- | ----------- |
+| Repository foundation     | In progress |
+| Business requirements     | Planned     |
+| Domain model              | Planned     |
+| Architecture              | Planned     |
+| Database specification    | Planned     |
+| API contracts             | Planned     |
+| Web application           | Planned     |
+| Mobile application        | Planned     |
+| AI capabilities           | Planned     |
+| Production infrastructure | Planned     |
 
 ## Source of Truth
 
