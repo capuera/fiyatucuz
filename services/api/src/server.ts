@@ -23,6 +23,11 @@ import {
   type AuthService,
   type OAuthRegistry,
 } from './modules/auth/index.js';
+import {
+  createMerchantService,
+  registerMerchantRoutes,
+  type MerchantService,
+} from './modules/merchants/index.js';
 
 export interface ServerDependencies {
   env: ApiEnv;
@@ -130,6 +135,13 @@ export async function buildServer(deps: ServerDependencies) {
     logger: deps.logger,
   });
   const oauth: OAuthRegistry = createOAuthRegistry(deps.authEnv);
+  // Merchants share the auth HMAC secret (site verification tokens are hashed
+  // with the same primitive as session/refresh tokens — see ADR-0015).
+  const merchantService: MerchantService = createMerchantService({
+    db: deps.db,
+    hmacSecret: deps.authEnv.AUTH_TOKEN_HMAC_SECRET,
+    logger: deps.logger,
+  });
 
   server.decorate('env', deps.env);
   server.decorate('db', deps.db);
@@ -137,6 +149,7 @@ export async function buildServer(deps: ServerDependencies) {
   server.decorate('broadcaster', broadcaster);
   server.decorate('auth', authService);
   server.decorate('oauth', oauth);
+  server.decorate('merchants', merchantService);
 
   // Cookie plugin must be registered before the auth middleware reads cookies.
   await server.register(fastifyCookie);
@@ -152,6 +165,10 @@ export async function buildServer(deps: ServerDependencies) {
     },
     prefix: '/v1/auth',
   });
+  await server.register(registerMerchantRoutes, {
+    merchantService,
+    prefix: '/v1/merchants',
+  });
 
   return server;
 }
@@ -163,6 +180,7 @@ declare module 'fastify' {
     jobs: JobQueue;
     broadcaster: Broadcaster;
     auth: AuthService;
+    merchants: MerchantService;
     oauth: OAuthRegistry;
   }
 }

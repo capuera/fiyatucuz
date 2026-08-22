@@ -36,6 +36,13 @@ export const LOG_REDACTION_PATHS: readonly string[] = [
   '*.access_token',
   '*.hmacSecret',
   '*.hmac_secret',
+  // Merchant site verification (ADR-0015): raw verification challenge tokens
+  // are as sensitive as auth tokens — a leaked one lets an attacker claim
+  // ownership of a domain.
+  '*.verificationToken',
+  '*.verification_token',
+  '*.verificationTokenHash',
+  '*.verification_token_hash',
 ];
 
 export function createLogger(env: ApiEnv): Logger {

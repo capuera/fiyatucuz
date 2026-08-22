@@ -7,3 +7,4 @@
 
 export * from './identity.js';
 export * from './tenants.js';
+export * from './merchants.js';

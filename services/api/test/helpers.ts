@@ -63,3 +63,24 @@ export async function truncateIdentityAndTenants(sql: Sql): Promise<void> {
     RESTART IDENTITY CASCADE
   `);
 }
+
+/**
+ * Truncate merchant tables + identity + tenants together (CASCADE handles the
+ * FK from merchant_sites → merchants and from merchants → tenants). Kept as
+ * an additive helper so existing tests continue to use the narrower one.
+ */
+export async function truncateAllBusinessTables(sql: Sql): Promise<void> {
+  await sql.unsafe(`
+    TRUNCATE TABLE
+      merchant_sites,
+      merchants,
+      refresh_tokens,
+      sessions,
+      credentials,
+      oauth_identities,
+      tenant_users,
+      tenants,
+      users
+    RESTART IDENTITY CASCADE
+  `);
+}
