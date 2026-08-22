@@ -3,7 +3,7 @@ import { createDbHandle, loadDbEnv } from '@fiyatucuz/db';
 import { buildServer } from './server.js';
 import { loadApiEnv } from './config/env.js';
 import { createLogger } from './lib/logger.js';
-import { loadAuthEnv } from './modules/auth/index.js';
+import { assertProductionCookieSecurity, loadAuthEnv } from './modules/auth/index.js';
 
 async function main(): Promise<void> {
   const env = loadApiEnv();
@@ -19,6 +19,10 @@ async function main(): Promise<void> {
   // Auth env owns AUTH_TOKEN_HMAC_SECRET and cookie / TTL configuration.
   // Fails fast if the HMAC secret is missing (see ADR-0014).
   const authEnv = loadAuthEnv();
+
+  // Boot-time refuse-to-start when production would ship insecure cookies
+  // (ADIM 10.1 §Production cookie security).
+  assertProductionCookieSecurity(authEnv, env.NODE_ENV);
 
   const server = await buildServer({ env, authEnv, logger, db: dbHandle.db });
 

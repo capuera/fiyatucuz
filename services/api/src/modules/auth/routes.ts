@@ -89,15 +89,31 @@ function replyError(reply: FastifyReply, status: number, code: string, message: 
 // Plugin
 // ---------------------------------------------------------------------------
 
+export interface AuthRoutesRateLimit {
+  readonly enabled: boolean;
+  readonly max: number;
+  readonly timeWindow: number | string;
+}
+
 export interface AuthRoutesOptions {
   readonly authService: AuthService;
+  readonly rateLimit?: AuthRoutesRateLimit;
 }
 
 export const registerAuthRoutes: FastifyPluginAsync<AuthRoutesOptions> = async (server, opts) => {
   const { authService } = opts;
 
+  // Rate-limit config for the sensitive auth endpoints. @fastify/rate-limit
+  // must have been registered at the parent scope; if not (e.g. minimal test
+  // harness), we simply omit the per-route config and requests are unlimited.
+  const rlOpts = opts.rateLimit;
+  const routeConfig =
+    rlOpts && rlOpts.enabled
+      ? { config: { rateLimit: { max: rlOpts.max, timeWindow: rlOpts.timeWindow } } }
+      : {};
+
   // POST /register -----------------------------------------------------------
-  server.post('/register', async (request, reply) => {
+  server.post('/register', routeConfig, async (request, reply) => {
     const parsed = RegisterBodySchema.safeParse(request.body);
     if (!parsed.success) {
       return replyError(reply, 400, 'INVALID_INPUT', parsed.error.issues[0]?.message ?? 'invalid input');
@@ -125,7 +141,7 @@ export const registerAuthRoutes: FastifyPluginAsync<AuthRoutesOptions> = async (
   });
 
   // POST /login --------------------------------------------------------------
-  server.post('/login', async (request, reply) => {
+  server.post('/login', routeConfig, async (request, reply) => {
     const parsed = LoginBodySchema.safeParse(request.body);
     if (!parsed.success) {
       return replyError(reply, 400, 'INVALID_INPUT', parsed.error.issues[0]?.message ?? 'invalid input');
@@ -137,8 +153,9 @@ export const registerAuthRoutes: FastifyPluginAsync<AuthRoutesOptions> = async (
     } catch (err) {
       if (err instanceof InvalidCredentialsError) {
         // Unified error surface — do NOT distinguish no_user / bad_password /
-        // blocked_user to the client. Reason is available for server logs.
-        request.log?.debug({ reason: err.reason }, 'login rejected');
+        // blocked_user to the client. Trace level only server-side so a
+        // normal (info+) log stream cannot serve as an enumeration signal.
+        request.log?.trace('auth attempt rejected');
         return replyError(reply, 401, err.code, 'invalid credentials');
       }
       throw err;
@@ -146,7 +163,7 @@ export const registerAuthRoutes: FastifyPluginAsync<AuthRoutesOptions> = async (
   });
 
   // POST /refresh ------------------------------------------------------------
-  server.post('/refresh', async (request, reply) => {
+  server.post('/refresh', routeConfig, async (request, reply) => {
     const rawRefresh = readRefreshCookie(request);
     try {
       const session = await authService.refresh(rawRefresh, requestMeta(request));

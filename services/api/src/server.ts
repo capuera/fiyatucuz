@@ -1,6 +1,9 @@
 import { randomUUID } from 'node:crypto';
 
 import fastifyCookie from '@fastify/cookie';
+import fastifyCors from '@fastify/cors';
+import fastifyHelmet from '@fastify/helmet';
+import fastifyRateLimit from '@fastify/rate-limit';
 import type { Db } from '@fiyatucuz/db';
 import Fastify, { LogController } from 'fastify';
 import type { Logger } from 'pino';
@@ -33,11 +36,89 @@ export interface ServerDependencies {
 // Return type is inferred so pino's Logger flows through cleanly instead of being
 // widened to Fastify's stricter FastifyBaseLogger (which trips `exactOptionalPropertyTypes`).
 export async function buildServer(deps: ServerDependencies) {
+  // Boot-time production-cookie assertion is called from src/index.ts before
+  // build; buildServer stays free of process-level assertions so it is safely
+  // reusable from tests (server.inject) without simulating a whole boot.
+
   const server = Fastify({
     loggerInstance: deps.logger,
     logController: new LogController({ disableRequestLogging: false }),
+    // trustProxy is configured explicitly (ADIM 10.1 §Trust proxy). Default
+    // is `false` — the app trusts no forwarded headers unless the deployment
+    // env says so. On Windows Server 2022 behind IIS/ARR, set
+    // API_TRUST_PROXY=true (or the IP of the IIS box).
+    trustProxy: deps.env.API_TRUST_PROXY,
     genReqId: (req) => (req.headers['x-request-id'] as string | undefined) ?? randomUUID(),
   });
+
+  // -- Security-hardening plugins (ADIM 10.1) -------------------------------
+  //
+  // Registration order matters:
+  //   1. helmet   — sets security headers on every response, including errors
+  //                 emitted by other plugins.
+  //   2. cors     — must run before rate-limit so preflight OPTIONS on a
+  //                 disallowed origin fails before consuming rate-limit budget.
+  //   3. rate-limit — global plugin decorator; per-route budgets attach in
+  //                 the auth routes.
+  //   4. cookie   — must precede the auth middleware (which reads cookies).
+  //   5. auth middleware, then routes.
+
+  await server.register(fastifyHelmet, {
+    // No CSP for JSON API — a CSP that breaks the eventual frontend is worse
+    // than none for now; revisit when the web app has a stable shape.
+    contentSecurityPolicy: false,
+    // Enable HSTS only when we know we're serving over HTTPS (proxied by the
+    // AUTH_COOKIE_SECURE flag, which the boot assertion pins to true in prod).
+    strictTransportSecurity: deps.authEnv.AUTH_COOKIE_SECURE
+      ? { maxAge: 31_536_000, includeSubDomains: true }
+      : false,
+  });
+
+  const isProd = deps.env.NODE_ENV === 'production';
+  const corsAllowlist = deps.env.CORS_ALLOWED_ORIGINS;
+  if (isProd && corsAllowlist.length === 0) {
+    throw new Error(
+      'CORS_ALLOWED_ORIGINS must contain at least one explicit origin when NODE_ENV=production',
+    );
+  }
+  await server.register(fastifyCors, {
+    origin: (origin, cb) => {
+      // Non-browser requests (curl, server-to-server) have no Origin header.
+      // Fastify passes undefined; allow — CORS is a browser-defense, and
+      // rejecting Origin-less requests would break health checks + tools.
+      if (!origin) return cb(null, true);
+      if (corsAllowlist.includes(origin)) return cb(null, true);
+      // Deny by returning `false` (never reflect the caller-supplied Origin).
+      cb(null, false);
+    },
+    credentials: true,
+    methods: ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Request-Id', 'X-Tenant-Id'],
+    maxAge: 600,
+  });
+
+  await server.register(fastifyRateLimit, {
+    // Register the plugin globally-decorated but off by default; individual
+    // routes opt in with `config.rateLimit`. Keeps unauthenticated /health,
+    // future public read paths etc. unaffected.
+    global: false,
+    // In-memory store. Redis is architecturally deferred (ADIM 10.1 §Rate
+    // limiting); this per-instance limiter is correct behavior for a single-
+    // node deploy and a conservative floor for a multi-node deploy.
+    max: deps.env.RATE_LIMIT_AUTH_MAX,
+    timeWindow: deps.env.RATE_LIMIT_AUTH_TIMEWINDOW,
+    // Do not derive keys from headers we don't trust. When trustProxy is off
+    // request.ip is the socket peer; when on, it's the forwarded client IP.
+    keyGenerator: (req) => req.ip,
+    enableDraftSpec: true,
+  });
+  if (!deps.env.RATE_LIMIT_ENABLED) {
+    // Explicit off-switch for load-test / bulk-fixture scenarios. Emits a
+    // structured warning so nobody ships prod with this flipped.
+    deps.logger.warn('RATE_LIMIT_ENABLED=false; auth endpoints are NOT rate-limited');
+  }
+
+  // -- Domain plugins -------------------------------------------------------
 
   // Foundation-only abstractions. Real implementations land with the first workload.
   const jobs: JobQueue = deps.jobs ?? new InProcessJobQueue(deps.logger);
@@ -62,7 +143,15 @@ export async function buildServer(deps: ServerDependencies) {
   await server.register(registerAuthMiddleware, { authService });
 
   await server.register(registerHealthRoutes);
-  await server.register(registerAuthRoutes, { authService, prefix: '/v1/auth' });
+  await server.register(registerAuthRoutes, {
+    authService,
+    rateLimit: {
+      enabled: deps.env.RATE_LIMIT_ENABLED,
+      max: deps.env.RATE_LIMIT_AUTH_MAX,
+      timeWindow: deps.env.RATE_LIMIT_AUTH_TIMEWINDOW,
+    },
+    prefix: '/v1/auth',
+  });
 
   return server;
 }

@@ -48,3 +48,34 @@ export type AuthEnv = z.infer<typeof AuthEnvSchema>;
 export function loadAuthEnv(source: Record<string, string | undefined> = process.env): AuthEnv {
   return loadEnv(AuthEnvSchema, source);
 }
+
+/**
+ * Boot-time assertion (ADIM 10.1 §Production cookie security).
+ *
+ * If NODE_ENV === 'production' the session/refresh cookies MUST be marked
+ * Secure, otherwise a proxy or intermediate can read them. Development and
+ * test continue to work with AUTH_COOKIE_SECURE=false.
+ *
+ * Deliberately throws — never silently overrides — so that a
+ * misconfiguration is a hard boot failure rather than a runtime security
+ * regression noticed months later.
+ */
+export class InsecureProductionCookieError extends Error {
+  readonly code = 'INSECURE_PRODUCTION_COOKIE' as const;
+  constructor() {
+    super(
+      'AUTH_COOKIE_SECURE must be true when NODE_ENV=production. ' +
+        'Set AUTH_COOKIE_SECURE=true (production must serve over HTTPS).',
+    );
+    this.name = 'InsecureProductionCookieError';
+  }
+}
+
+export function assertProductionCookieSecurity(
+  authEnv: AuthEnv,
+  nodeEnv: string,
+): void {
+  if (nodeEnv === 'production' && authEnv.AUTH_COOKIE_SECURE !== true) {
+    throw new InsecureProductionCookieError();
+  }
+}

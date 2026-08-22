@@ -147,6 +147,30 @@ export async function findRefreshTokenByHash(
   return rows[0] ?? null;
 }
 
+/**
+ * Same lookup as {@link findRefreshTokenByHash} but acquires a `FOR UPDATE`
+ * row-lock on the matching row (ADIM 10.1 §Refresh token concurrency).
+ *
+ * PostgreSQL semantics: two concurrent transactions calling this on the same
+ * token both attempt to acquire the row lock. The first wins; the second
+ * blocks until the first COMMITs, at which point the second's SELECT sees
+ * the LATEST committed row state (even under READ COMMITTED). This lets the
+ * caller detect the "already rotated / already revoked" state deterministically
+ * and route the second attempt into reuse-detection.
+ */
+export async function lockRefreshTokenByHash(
+  tx: Tx,
+  tokenHash: string,
+): Promise<RefreshTokenRow | null> {
+  const rows = await tx
+    .select()
+    .from(refreshTokens)
+    .where(eq(refreshTokens.tokenHash, tokenHash))
+    .for('update')
+    .limit(1);
+  return rows[0] ?? null;
+}
+
 export async function insertRefreshToken(
   tx: Tx,
   input: RefreshTokenInsert,

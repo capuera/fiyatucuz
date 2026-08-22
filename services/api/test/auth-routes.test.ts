@@ -54,11 +54,46 @@ describe.skipIf(!reachable)('auth — HTTP routes (integration via server.inject
     expect(cookies).toContain('fu_session');
     expect(cookies).toContain('fu_refresh');
 
-    // Raw token values MUST NOT appear in the body.
+    // Raw token values MUST NOT appear in the body (ADIM 10.1 §Cookie test
+    // coverage). Also verify neither raw token appears anywhere in the JSON.
     const raw = res.body;
     for (const c of res.cookies) {
       expect(raw).not.toContain(c.value);
     }
+  });
+
+  it('POST /v1/auth/register → cookies carry HttpOnly + SameSite=Lax + correct Path + Expires (ADIM 10.1 §Cookie coverage)', async () => {
+    const server = await serverPromise;
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/auth/register',
+      payload: { email: 'cookie@example.com', password: 'ValidPass1!' },
+    });
+    expect(res.statusCode).toBe(201);
+
+    // light-my-request exposes parsed cookies with all attributes.
+    const session = res.cookies.find((c) => c.name === 'fu_session');
+    const refresh = res.cookies.find((c) => c.name === 'fu_refresh');
+    expect(session).toBeDefined();
+    expect(refresh).toBeDefined();
+
+    // Session cookie: HttpOnly, SameSite=Lax, Path=/, Secure follows env
+    // (absent → falsy when AUTH_COOKIE_SECURE=false — light-my-request
+    // reports the attribute only when it's actually set).
+    expect(session?.httpOnly).toBe(true);
+    expect(String(session?.sameSite ?? '').toLowerCase()).toBe('lax');
+    expect(session?.path).toBe('/');
+    expect(session?.secure ?? false).toBe(false);
+    // maxAge OR expires must be present so the cookie is not a session-only cookie.
+    expect(session?.maxAge ?? session?.expires ? true : false).toBe(true);
+
+    // Refresh cookie: same shape, but path is restricted to /v1/auth so it is
+    // never sent with normal API traffic.
+    expect(refresh?.httpOnly).toBe(true);
+    expect(String(refresh?.sameSite ?? '').toLowerCase()).toBe('lax');
+    expect(refresh?.path).toBe('/v1/auth');
+    expect(refresh?.secure ?? false).toBe(false);
+    expect(refresh?.maxAge ?? refresh?.expires ? true : false).toBe(true);
   });
 
   it('POST /v1/auth/register → 400 on invalid input (short password)', async () => {
@@ -178,6 +213,38 @@ describe.skipIf(!reachable)('auth — HTTP routes (integration via server.inject
     expect(res.statusCode).toBe(204);
     const cleared = res.cookies.map((x) => x.name).sort();
     expect(cleared).toEqual(['fu_refresh', 'fu_session']);
+  });
+});
+
+describe.skipIf(!reachable)('auth cookies: Secure follows AUTH_COOKIE_SECURE (ADIM 10.1 §Cookie coverage)', () => {
+  it('cookies get Secure=true when AUTH_COOKIE_SECURE=true', async () => {
+    const dbHandle = makeTestDbHandle();
+    const env = loadApiEnv({
+      NODE_ENV: 'test',
+      LOG_LEVEL: 'error',
+      API_HOST: '127.0.0.1',
+    });
+    const authEnv = loadAuthEnv({
+      AUTH_TOKEN_HMAC_SECRET: 'test_only_fixed_hmac_secret_at_least_32_chars_long_xxxxxxx',
+      AUTH_COOKIE_SECURE: 'true',
+    });
+    const logger = createLogger(env);
+    const server = await buildServer({ env, authEnv, logger, db: dbHandle.db });
+    try {
+      const res = await server.inject({
+        method: 'POST',
+        url: '/v1/auth/register',
+        payload: { email: 'secure-cookie@example.com', password: 'ValidPass1!' },
+      });
+      expect(res.statusCode).toBe(201);
+      const session = res.cookies.find((c) => c.name === 'fu_session');
+      const refresh = res.cookies.find((c) => c.name === 'fu_refresh');
+      expect(session?.secure).toBe(true);
+      expect(refresh?.secure).toBe(true);
+    } finally {
+      await server.close();
+      await dbHandle.close();
+    }
   });
 });
 

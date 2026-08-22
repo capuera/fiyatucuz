@@ -333,6 +333,67 @@ describe.skipIf(!reachable)('auth — service layer (integration)', () => {
       }),
     ).rejects.toThrow();
   });
+
+  // -- Concurrency regressions (ADIM 10.1) ----------------------------------
+
+  it('register race: two concurrent registrations with the same email → one 201, one clean 409', async () => {
+    const email = 'race@example.com';
+    const [a, b] = await Promise.allSettled([
+      svc.authService.register({ email, password: 'ValidPass1!' }),
+      svc.authService.register({ email: email.toUpperCase(), password: 'ValidPass1!' }),
+    ]);
+    const outcomes = [a, b].map((r) => (r.status === 'fulfilled' ? 'ok' : (r.reason as Error).name));
+    // Exactly one succeeded; the other is UserAlreadyExistsError (translated
+    // from PG 23505 by the service). Never an untranslated pg error /
+    // Error / TypeError.
+    const succeeded = outcomes.filter((o) => o === 'ok').length;
+    const rejected = outcomes.filter((o) => o === 'UserAlreadyExistsError').length;
+    expect(succeeded).toBe(1);
+    expect(rejected).toBe(1);
+
+    // Exactly one users row was created.
+    const rows = await dbHandle.sql`select id from users where email_normalized = ${email.toLowerCase()}`;
+    expect(rows.length).toBe(1);
+  });
+
+  it('refresh race: two concurrent refreshes with the same raw token → one 200, one reuse', async () => {
+    const s = await svc.authService.register({
+      email: 'refrace@example.com',
+      password: 'ValidPass1!',
+    });
+
+    const [a, b] = await Promise.allSettled([
+      svc.authService.refresh(s.tokens.refreshToken),
+      svc.authService.refresh(s.tokens.refreshToken),
+    ]);
+    const oks = [a, b].filter((r) => r.status === 'fulfilled').length;
+    const errs = [a, b].filter((r) => r.status === 'rejected') as PromiseRejectedResult[];
+    // Exactly one succeeded — the SELECT FOR UPDATE serializes and the second
+    // wakes to see revoked_at set. This is the deterministic outcome we want.
+    expect(oks).toBe(1);
+    expect(errs.length).toBe(1);
+    const loser = errs[0]?.reason;
+    expect(loser).toBeInstanceOf(InvalidRefreshTokenError);
+    // The loser correctly identifies reuse — the same-tx revocation branch
+    // fires because the row is already revoked when it acquires the lock.
+    expect((loser as InvalidRefreshTokenError).reason).toBe('reuse');
+
+    // Reuse detection burns the whole session: session revoked, every
+    // refresh row in the family revoked.
+    const sessRow = await dbHandle.sql`select revoked_at from sessions`;
+    expect((sessRow[0] as { revoked_at: Date | null }).revoked_at).not.toBeNull();
+    const rtRows = await dbHandle.sql`select revoked_at from refresh_tokens`;
+    for (const r of rtRows as Array<{ revoked_at: Date | null }>) {
+      expect(r.revoked_at).not.toBeNull();
+    }
+
+    // No two valid replacement chains from the same parent token.
+    const rt = await dbHandle.sql`
+      select count(*)::int as c from refresh_tokens
+    `;
+    // Original + at most one new row inserted by the winner.
+    expect((rt[0] as { c: number }).c).toBeLessThanOrEqual(2);
+  });
 });
 
 if (!reachable) {

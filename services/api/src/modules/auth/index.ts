@@ -3,7 +3,12 @@
 // Per ADR-0003 (modular monolith), other modules import ONLY from this
 // barrel — never from routes.ts, service.ts, repository.ts, etc.
 
-export { loadAuthEnv, type AuthEnv } from './env.js';
+export {
+  loadAuthEnv,
+  assertProductionCookieSecurity,
+  InsecureProductionCookieError,
+  type AuthEnv,
+} from './env.js';
 
 export {
   createAuthService,

@@ -16,6 +16,9 @@
   },
   "dependencies": {
     "@fastify/cookie": "^11.0.2",
+    "@fastify/cors": "^11.0.1",
+    "@fastify/helmet": "^13.0.1",
+    "@fastify/rate-limit": "^10.3.0",
     "@fiyatucuz/config": "workspace:*",
     "@fiyatucuz/db": "workspace:*",
     "@fiyatucuz/types": "workspace:*",

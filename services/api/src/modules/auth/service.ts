@@ -141,6 +141,18 @@ function toAuthenticatedUser(u: repo.UserRow): AuthenticatedUser {
   };
 }
 
+/**
+ * Recognize PostgreSQL unique-violation (SQLSTATE 23505). postgres.js surfaces
+ * errors with `.code` set; drizzle-orm bubbles them unwrapped from execute().
+ * Kept narrowly scoped — the auth service is the only place we currently
+ * expect to translate the low-level code into a domain error.
+ */
+function isUniqueViolation(err: unknown): boolean {
+  if (err === null || typeof err !== 'object') return false;
+  const code = (err as { code?: unknown }).code;
+  return typeof code === 'string' && code === '23505';
+}
+
 export function createAuthService(deps: AuthServiceDeps): AuthService {
   assertSecretShape(deps.env.AUTH_TOKEN_HMAC_SECRET);
   const { db, env, logger } = deps;
@@ -193,21 +205,40 @@ export function createAuthService(deps: AuthServiceDeps): AuthService {
       const passwordHash = await hashPassword(input.password);
 
       const outcome = await transaction(db, async (tx) => {
+        // Fast-path duplicate check: cheap when the caller is honest, but
+        // does NOT close the race between the SELECT and the INSERT. The
+        // authoritative gate is the DB UNIQUE constraint on
+        // users.email_normalized (see 0002_identity_tenants.sql). Two
+        // concurrent registrations that both pass the SELECT will race on
+        // INSERT; one gets 23505 and we translate it back into the same
+        // UserAlreadyExistsError — no 500. See ADIM 10.1 §Register race.
         const existing = await repo.findUserByNormalizedEmail(tx, emailNormalized);
         if (existing) throw new UserAlreadyExistsError(emailNormalized);
 
-        const inserted = await tx
-          .insert(users)
-          .values({
-            id: newId(),
-            email: input.email.trim(),
-            emailNormalized,
-            displayName: input.displayName ?? null,
-            status: 'ACTIVE',
-          })
-          .returning();
-        const user = inserted[0];
-        if (!user) throw new Error('register: user insert returned no row');
+        let user: repo.UserRow;
+        try {
+          const inserted = await tx
+            .insert(users)
+            .values({
+              id: newId(),
+              email: input.email.trim(),
+              emailNormalized,
+              displayName: input.displayName ?? null,
+              status: 'ACTIVE',
+            })
+            .returning();
+          const row = inserted[0];
+          if (!row) throw new Error('register: user insert returned no row');
+          user = row;
+        } catch (err) {
+          if (isUniqueViolation(err)) {
+            // Another concurrent transaction inserted the same
+            // email_normalized between our SELECT and this INSERT. Same
+            // observable behavior as the fast-path check.
+            throw new UserAlreadyExistsError(emailNormalized);
+          }
+          throw err;
+        }
 
         await repo.insertCredential(tx, {
           id: newId(),
@@ -285,9 +316,13 @@ export function createAuthService(deps: AuthServiceDeps): AuthService {
       }
       const presentedHash = hash(rawRefreshToken);
 
-      // We route via a discriminated-union return so the transaction can COMMIT
-      // its work before we throw. A previous implementation revoked inside the
-      // same tx that threw the reuse error, which rolled the revocation back.
+      // Discriminated-union return so the transaction commits its writes
+      // before we throw. Concurrency: `lockRefreshTokenByHash` uses SELECT
+      // ... FOR UPDATE (ADIM 10.1 §Refresh token concurrency), so two
+      // concurrent refreshes with the same raw token serialize — the second
+      // wakes to see revoked_at set and lands in the reuse branch, which
+      // performs the revocation in the SAME transaction (so it commits
+      // even though we then throw outside the tx).
       type Outcome =
         | { readonly kind: 'not_found' }
         | { readonly kind: 'expired' }
@@ -300,13 +335,16 @@ export function createAuthService(deps: AuthServiceDeps): AuthService {
           };
 
       const outcome = await transaction<Outcome>(db, async (tx) => {
-        const stored = await repo.findRefreshTokenByHash(tx, presentedHash);
+        const stored = await repo.lockRefreshTokenByHash(tx, presentedHash);
         if (!stored) return { kind: 'not_found' };
 
-        // REUSE: revoked token replayed. Return a marker so the caller can
-        // commit the current tx (this branch does no writes yet) and then
-        // execute the revocation in a fresh transaction.
+        // REUSE: revoked token replayed OR the concurrent-refresh loser.
+        // Burn down the whole session in THIS transaction so the writes
+        // commit together with the SELECT FOR UPDATE lock release; then
+        // return a marker and let the outer scope throw.
         if (stored.revokedAt !== null) {
+          await repo.revokeSession(tx, stored.sessionId);
+          await repo.revokeAllRefreshTokensForSession(tx, stored.sessionId);
           return { kind: 'reuse', sessionId: stored.sessionId, refreshTokenId: stored.id };
         }
 
@@ -359,11 +397,6 @@ export function createAuthService(deps: AuthServiceDeps): AuthService {
       if (outcome.kind === 'expired') throw new InvalidRefreshTokenError('expired');
       if (outcome.kind === 'revoked') throw new InvalidRefreshTokenError('revoked');
       if (outcome.kind === 'reuse') {
-        // Burn down the whole session in a fresh transaction so it commits.
-        await transaction(db, async (tx) => {
-          await repo.revokeSession(tx, outcome.sessionId);
-          await repo.revokeAllRefreshTokensForSession(tx, outcome.sessionId);
-        });
         logger?.warn(
           { sessionId: outcome.sessionId, refreshTokenId: outcome.refreshTokenId },
           'refresh token reuse detected; session revoked',
