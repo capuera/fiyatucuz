@@ -13,7 +13,7 @@ export { newId } from './id.js';
 // Re-export the drizzle-orm SQL operators consumers actually use. This keeps
 // bounded contexts from taking a direct dependency on drizzle-orm and lets
 // us swap the underlying library later without a cross-repo refactor.
-export { and, eq, or, sql, inArray, isNotNull, isNull, not } from 'drizzle-orm';
+export { and, asc, desc, eq, or, sql, inArray, isNotNull, isNull, not } from 'drizzle-orm';
 export {
   applyMigrations,
   ensureMigrationsTable,

@@ -85,6 +85,15 @@ const ApiEnvSchema = z.object({
    * "1 minute", "10 seconds") — passed through to @fastify/rate-limit.
    */
   RATE_LIMIT_AUTH_TIMEWINDOW: z.string().min(1).default('1 minute'),
+
+  /**
+   * Rate limit for POST /v1/…/feeds/:feedId/fetch (ADIM 12.1). Manual feed
+   * fetches enqueue a background job that touches an untrusted external URL;
+   * we cap per-client to protect our own outbound bandwidth + prevent a
+   * caller from spamming the JobQueue. Read endpoints are UNRESTRICTED.
+   */
+  RATE_LIMIT_FEED_FETCH_MAX: z.coerce.number().int().min(1).max(1000).default(5),
+  RATE_LIMIT_FEED_FETCH_TIMEWINDOW: z.string().min(1).default('1 minute'),
 });
 
 export type ApiEnv = z.infer<typeof ApiEnvSchema>;

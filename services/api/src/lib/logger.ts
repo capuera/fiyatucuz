@@ -43,6 +43,12 @@ export const LOG_REDACTION_PATHS: readonly string[] = [
   '*.verification_token',
   '*.verificationTokenHash',
   '*.verification_token_hash',
+  // Feed ingestion (ADR-0016): raw feed body must never appear in logs.
+  // rawArchiveRef is metadata, not sensitive, but pino redact costs almost
+  // nothing so we redact any 'feedBody' variant defensively.
+  '*.feedBody',
+  '*.feed_body',
+  '*.rawFeedBody',
 ];
 
 export function createLogger(env: ApiEnv): Logger {

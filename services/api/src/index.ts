@@ -4,6 +4,7 @@ import { buildServer } from './server.js';
 import { loadApiEnv } from './config/env.js';
 import { createLogger } from './lib/logger.js';
 import { assertProductionCookieSecurity, loadAuthEnv } from './modules/auth/index.js';
+import { assertProductionFeedFetchSafety, loadFeedEnv } from './modules/feeds/index.js';
 
 async function main(): Promise<void> {
   const env = loadApiEnv();
@@ -24,7 +25,13 @@ async function main(): Promise<void> {
   // (ADIM 10.1 §Production cookie security).
   assertProductionCookieSecurity(authEnv, env.NODE_ENV);
 
-  const server = await buildServer({ env, authEnv, logger, db: dbHandle.db });
+  // Feed env owns fetch timeouts, byte cap, redirect cap, user-agent, and
+  // the TEST-ONLY private-address bypass. Boot-fails if the bypass is on
+  // in production (ADR-0016 §SSRF).
+  const feedEnv = loadFeedEnv();
+  assertProductionFeedFetchSafety(feedEnv, env.NODE_ENV);
+
+  const server = await buildServer({ env, authEnv, feedEnv, logger, db: dbHandle.db });
 
   try {
     await server.listen({ host: env.API_HOST, port: env.API_PORT });

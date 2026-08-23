@@ -27,6 +27,7 @@
     "fastify": "^5.2.0",
     "fastify-plugin": "^5.0.1",
     "pino": "^9.5.0",
+    "undici": "^6.21.0",
     "zod": "^3.24.1"
   },
   "devDependencies": {

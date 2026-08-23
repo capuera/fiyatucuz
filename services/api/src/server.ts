@@ -28,10 +28,17 @@ import {
   registerMerchantRoutes,
   type MerchantService,
 } from './modules/merchants/index.js';
+import {
+  createFeedService,
+  registerFeedRoutes,
+  type FeedEnv,
+  type FeedService,
+} from './modules/feeds/index.js';
 
 export interface ServerDependencies {
   env: ApiEnv;
   authEnv: AuthEnv;
+  feedEnv: FeedEnv;
   logger: Logger;
   db: Db;
   jobs?: JobQueue;
@@ -142,6 +149,16 @@ export async function buildServer(deps: ServerDependencies) {
     hmacSecret: deps.authEnv.AUTH_TOKEN_HMAC_SECRET,
     logger: deps.logger,
   });
+  // Feeds depend on the merchant service (site containment checks) + the
+  // JobQueue for background fetch execution — ADIM 12 / ADR-0016.
+  const feedService: FeedService = createFeedService({
+    db: deps.db,
+    env: deps.feedEnv,
+    merchants: merchantService,
+    jobs,
+    logger: deps.logger,
+  });
+  feedService.registerJobHandlers(jobs);
 
   server.decorate('env', deps.env);
   server.decorate('db', deps.db);
@@ -150,6 +167,7 @@ export async function buildServer(deps: ServerDependencies) {
   server.decorate('auth', authService);
   server.decorate('oauth', oauth);
   server.decorate('merchants', merchantService);
+  server.decorate('feeds', feedService);
 
   // Cookie plugin must be registered before the auth middleware reads cookies.
   await server.register(fastifyCookie);
@@ -169,6 +187,18 @@ export async function buildServer(deps: ServerDependencies) {
     merchantService,
     prefix: '/v1/merchants',
   });
+  await server.register(registerFeedRoutes, {
+    feedService,
+    // Rate-limit POST …/fetch only (ADIM 12.1). Read endpoints (GET feeds,
+    // GET fetches) remain unlimited so a UI can freely poll fetch state.
+    fetchRateLimit: {
+      enabled: deps.env.RATE_LIMIT_ENABLED,
+      max: deps.env.RATE_LIMIT_FEED_FETCH_MAX,
+      timeWindow: deps.env.RATE_LIMIT_FEED_FETCH_TIMEWINDOW,
+    },
+    // Mount under /v1/merchants — feed routes are children of a site.
+    prefix: '/v1/merchants',
+  });
 
   return server;
 }
@@ -181,6 +211,7 @@ declare module 'fastify' {
     broadcaster: Broadcaster;
     auth: AuthService;
     merchants: MerchantService;
+    feeds: FeedService;
     oauth: OAuthRegistry;
   }
 }
