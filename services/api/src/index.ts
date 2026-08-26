@@ -4,7 +4,11 @@ import { buildServer } from './server.js';
 import { loadApiEnv } from './config/env.js';
 import { createLogger } from './lib/logger.js';
 import { assertProductionCookieSecurity, loadAuthEnv } from './modules/auth/index.js';
-import { assertProductionFeedFetchSafety, loadFeedEnv } from './modules/feeds/index.js';
+import {
+  assertProductionFeedArchiveSafety,
+  assertProductionFeedFetchSafety,
+  loadFeedEnv,
+} from './modules/feeds/index.js';
 
 async function main(): Promise<void> {
   const env = loadApiEnv();
@@ -30,6 +34,9 @@ async function main(): Promise<void> {
   // in production (ADR-0016 §SSRF).
   const feedEnv = loadFeedEnv();
   assertProductionFeedFetchSafety(feedEnv, env.NODE_ENV);
+  // ADR-0017 §Config: production must set an explicit absolute
+  // FEED_ARCHIVE_LOCAL_ROOT — the dev tmpdir fallback is unsafe there.
+  assertProductionFeedArchiveSafety(feedEnv, env.NODE_ENV);
 
   const server = await buildServer({ env, authEnv, feedEnv, logger, db: dbHandle.db });
 

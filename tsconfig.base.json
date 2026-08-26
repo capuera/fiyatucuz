@@ -26,7 +26,9 @@
     "declaration": true,
     "declarationMap": true,
     "sourceMap": true,
-    "incremental": true
+    "incremental": true,
+
+    "customConditions": ["development"]
   },
   "exclude": ["node_modules", "dist", "build", ".next", ".expo"]
 }

@@ -8,6 +8,7 @@ import {
   type MerchantService,
 } from '../merchants/index.js';
 
+import { createFeedArchive, type FeedArchive } from './archive/index.js';
 import type { FeedEnv } from './env.js';
 import {
   createSafeFeedFetcher,
@@ -135,6 +136,12 @@ export interface FeedServiceDeps {
   readonly merchants: MerchantService;
   readonly jobs: JobQueue;
   readonly fetcher?: SafeFeedFetcher;
+  /**
+   * Raw-body archive (ADR-0017). Defaults to `createFeedArchive(env)` when
+   * omitted — tests may inject an in-memory or temp-directory-scoped
+   * implementation.
+   */
+  readonly archive?: FeedArchive;
   readonly logger?: Logger;
 }
 
@@ -163,13 +170,44 @@ function sanitizeErrorMessage(input: string, cap = 500): string {
   return oneLine.length > cap ? oneLine.slice(0, cap) : oneLine;
 }
 
+/**
+ * Poll for the fetch row to reach a terminal state — used when another
+ * worker won the atomic-claim race in `performFetch`. Returns as soon as
+ * the row is not QUEUED / not FETCHING, or throws on timeout.
+ */
+async function waitForTerminalFetchState(
+  db: Db,
+  tenantId: string,
+  fetchId: string,
+  timeoutMs: number,
+): Promise<repo.FeedFetchRow> {
+  const deadline = Date.now() + timeoutMs;
+  // 25 ms polling is short enough for tests, coarse enough not to hammer.
+  const step = 25;
+  while (true) {
+    const row = await withTenantTransaction(db, tenantId, (tx) =>
+      repo.findFetchByIdAcrossFeeds(tx, tenantId, fetchId),
+    );
+    if (!row) throw new FeedFetchNotFoundError(fetchId);
+    if (row.status !== 'QUEUED' && row.status !== 'FETCHING') return row;
+    if (Date.now() >= deadline) {
+      throw new FetchError(
+        'READ_TIMEOUT',
+        `timed out waiting for concurrent worker on fetch ${fetchId}`,
+      );
+    }
+    await new Promise((resolve) => setTimeout(resolve, step));
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Factory
 // ---------------------------------------------------------------------------
 
 export function createFeedService(deps: FeedServiceDeps): FeedService {
   const { db, env, merchants, jobs, logger } = deps;
-  const fetcher: SafeFeedFetcher = deps.fetcher ?? createSafeFeedFetcher({ env });
+  const archive: FeedArchive = deps.archive ?? createFeedArchive(env);
+  const fetcher: SafeFeedFetcher = deps.fetcher ?? createSafeFeedFetcher({ env, archive });
 
   async function requireFeed(
     tx: Tx,
@@ -303,16 +341,22 @@ export function createFeedService(deps: FeedServiceDeps): FeedService {
     },
 
     async performFetch(tenantId, fetchId) {
-      // Step 1: load the feed + move fetch → FETCHING in one tx.
+      // Step 1: atomically claim the QUEUED row for this worker and load
+      // the associated feed. The claim uses a conditional UPDATE (see
+      // repo.claimFetchForWorker) so two concurrent workers cannot both
+      // proceed with the fetch — critical since ADIM 13, where a losing
+      // worker would fail archive finalization with ARCHIVE_ALREADY_EXISTS.
       const preflight = await withTenantTransaction(db, tenantId, async (tx) => {
-        const fetchRow = await repo.findFetchByIdAcrossFeeds(tx, tenantId, fetchId);
-        if (!fetchRow) throw new FeedFetchNotFoundError(fetchId);
-        if (fetchRow.status !== 'QUEUED') {
-          // Idempotency: another worker already picked this up. Return what
-          // is there; the caller can decide whether to retry.
-          return { alreadyStarted: true as const, row: fetchRow };
+        const existing = await repo.findFetchByIdAcrossFeeds(tx, tenantId, fetchId);
+        if (!existing) throw new FeedFetchNotFoundError(fetchId);
+        const claimed = await repo.claimFetchForWorker(tx, tenantId, fetchId, new Date());
+        if (!claimed) {
+          // Row exists but wasn't in QUEUED — another worker already
+          // picked it up. Return the current row; the caller decides
+          // whether to retry.
+          return { alreadyStarted: true as const, row: existing };
         }
-        const feed = await repo.findFeedByIdForTenant(tx, tenantId, fetchRow.feedId);
+        const feed = await repo.findFeedByIdForTenant(tx, tenantId, claimed.feedId);
         if (!feed) {
           // Should be impossible under the composite FK, but fail closed.
           await repo.markFetchState(tx, tenantId, fetchId, {
@@ -321,16 +365,23 @@ export function createFeedService(deps: FeedServiceDeps): FeedService {
             errorMessage: 'feed row missing',
             finishedAt: new Date(),
           });
-          throw new FeedNotFoundError(fetchRow.feedId);
+          throw new FeedNotFoundError(claimed.feedId);
         }
-        const marked = await repo.markFetchState(tx, tenantId, fetchId, {
-          status: 'FETCHING',
-          startedAt: new Date(),
-        });
-        return { alreadyStarted: false as const, feed, row: marked ?? fetchRow };
+        return { alreadyStarted: false as const, feed, row: claimed };
       });
 
-      if (preflight.alreadyStarted) return preflight.row;
+      if (preflight.alreadyStarted) {
+        // Another worker won the race for this fetchId. Wait for it to
+        // reach a terminal state so callers (tests, admin endpoints)
+        // always see a completed row. Bounded to the fetch timeout so a
+        // stalled worker cannot hang us indefinitely.
+        return await waitForTerminalFetchState(
+          db,
+          tenantId,
+          fetchId,
+          env.FEED_FETCH_TIMEOUT_MS,
+        );
+      }
 
       const { feed } = preflight;
 
@@ -342,6 +393,14 @@ export function createFeedService(deps: FeedServiceDeps): FeedService {
           format: feed.format,
           etag: feed.etag,
           lastModified: feed.lastModified,
+          // Trusted IDs — never derived from user input. See ADR-0017
+          // §Archive reference for why this shape is safe.
+          archiveKey: {
+            tenantId,
+            feedId: feed.id,
+            fetchId,
+            format: feed.format,
+          },
         });
       } catch (err) {
         const msg = sanitizeErrorMessage(err instanceof Error ? err.message : String(err));
@@ -353,6 +412,10 @@ export function createFeedService(deps: FeedServiceDeps): FeedService {
       return withTenantTransaction(db, tenantId, async (tx) => {
         const now = new Date();
         if (result.kind === 'success') {
+          // rawArchiveRef is only set here — no code path before finalize
+          // reaches this branch (see fetcher.ts). Persisting the ref on
+          // SUCCESS is the ADR-0017 §Failure semantics contract: an archive
+          // reference in the DB means the bytes were finalized.
           const updated = await repo.markFetchState(tx, tenantId, fetchId, {
             status: 'SUCCESS',
             httpStatus: result.httpStatus,
@@ -361,6 +424,7 @@ export function createFeedService(deps: FeedServiceDeps): FeedService {
             contentHash: result.contentHash,
             etag: result.etag,
             lastModified: result.lastModified,
+            rawArchiveRef: result.archiveRef,
             finishedAt: now,
           });
           await repo.updateFeedFetchCursor(tx, tenantId, feed.id, {
@@ -370,7 +434,24 @@ export function createFeedService(deps: FeedServiceDeps): FeedService {
             lastModified: result.lastModified,
             status: 'ACTIVE',
           });
-          if (!updated) throw new FeedFetchNotFoundError(fetchId);
+          if (!updated) {
+            // DB update failed AFTER archive finalize — the object is now
+            // orphaned. Best-effort cleanup here; if that fails too, a
+            // future reconciliation job (documented in ADR-0017 §Retention)
+            // is the right home for cleanup. We do NOT let this be swallowed
+            // silently — surface the fetch-not-found as before.
+            if (result.archiveRef) {
+              try {
+                await archive.delete(result.archiveRef);
+              } catch (err) {
+                logger?.warn(
+                  { err, fetchId, archiveRef: result.archiveRef },
+                  'orphan archive object left after DB update failed',
+                );
+              }
+            }
+            throw new FeedFetchNotFoundError(fetchId);
+          }
           return updated;
         }
         if (result.kind === 'not_modified') {

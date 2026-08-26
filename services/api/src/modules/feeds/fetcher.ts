@@ -3,6 +3,13 @@ import type { LookupFunction } from 'node:net';
 
 import { Agent, fetch as undiciFetch, type Dispatcher } from 'undici';
 
+import {
+  FeedArchiveError,
+  type FeedArchive,
+  type FeedArchiveKey,
+  type FeedArchiveRef,
+  type FeedArchiveWriter,
+} from './archive/index.js';
 import type { FeedEnv } from './env.js';
 import {
   assertUtf8XmlPrefix,
@@ -30,6 +37,7 @@ export type FetchErrorCode =
   | 'HTTP_ERROR'
   | 'XML_ENCODING_REJECTED'
   | 'XML_SECURITY_REJECTED'
+  | 'ARCHIVE_WRITE_FAILED'
   | 'FETCH_FAILED';
 
 export class FetchError extends Error {
@@ -52,6 +60,14 @@ export interface FetchInput {
   /** From feeds table — sent as conditional headers if present. */
   readonly etag?: string | null;
   readonly lastModified?: string | null;
+  /**
+   * When set together with the fetcher's `archive` option, the raw bytes of
+   * a successful fetch are streamed into the archive and the resulting
+   * opaque reference is returned in `FetchSuccessResult.archiveRef`
+   * (ADR-0017). Never construct this key from user-supplied strings — the
+   * IDs must be trusted UUIDs from the DB.
+   */
+  readonly archiveKey?: FeedArchiveKey;
 }
 
 export interface FetchSuccessResult {
@@ -62,6 +78,12 @@ export interface FetchSuccessResult {
   readonly contentHash: string;
   readonly etag: string | null;
   readonly lastModified: string | null;
+  /**
+   * Opaque `feed-archive://…` reference — set iff an archive + archiveKey
+   * were provided and the raw body was successfully finalized. Otherwise
+   * `null`. Callers persist this in `feed_fetches.raw_archive_ref`.
+   */
+  readonly archiveRef: FeedArchiveRef | null;
 }
 
 export interface FetchNotModifiedResult {
@@ -114,6 +136,14 @@ export interface SafeFeedFetcherOptions {
   readonly env: FeedEnv;
   /** Injectable DNS lookup for tests. */
   readonly lookup?: SafeUrlValidatorOptions['lookup'];
+  /**
+   * Raw-body archive (ADR-0017). When provided AND `FetchInput.archiveKey`
+   * is set on a specific call, the fetcher opens a writer at the start of
+   * the response, streams every chunk into it alongside hashing/scanning,
+   * and finalizes on success. On any rejection/failure the writer is
+   * aborted (temp file removed) so no half-written archive survives.
+   */
+  readonly archive?: FeedArchive;
 }
 
 export interface SafeFeedFetcher {
@@ -165,6 +195,7 @@ function createPinnedAgent(ip: string, family: 4 | 6): Dispatcher {
 export function createSafeFeedFetcher(opts: SafeFeedFetcherOptions): SafeFeedFetcher {
   const { env } = opts;
   const lookup = opts.lookup;
+  const archive = opts.archive;
 
   return {
     async fetch(input: FetchInput): Promise<FetchResult> {
@@ -345,11 +376,48 @@ export function createSafeFeedFetcher(opts: SafeFeedFetcherOptions): SafeFeedFet
         };
       }
 
+      // Open the raw-body archive writer AFTER the response is confirmed
+      // 2xx + accepted content-type (ADR-0017 §Failure semantics). Every
+      // exit path below MUST call closeAndAbort() so a partial temp file
+      // is never left behind; the only path that produces a visible
+      // archive object is writer.finalize() at the very end.
+      let writer: FeedArchiveWriter | null = null;
+      if (archive && input.archiveKey) {
+        try {
+          writer = await archive.openWriter(input.archiveKey);
+        } catch (err) {
+          await closeActiveAgent();
+          try {
+            await response.body?.cancel();
+          } catch {
+            /* ignore */
+          }
+          const msg = err instanceof Error ? err.message : String(err);
+          return {
+            kind: 'failure',
+            code: 'ARCHIVE_WRITE_FAILED',
+            errorMessage: `archive.openWriter: ${msg}`,
+            httpStatus,
+          };
+        }
+      }
+      async function closeAndAbort(): Promise<void> {
+        await closeActiveAgent();
+        if (writer) {
+          try {
+            await writer.abort();
+          } catch {
+            /* ignore */
+          }
+          writer = null;
+        }
+      }
+
       // Streaming download — hash + byte-cap + STREAM-WIDE XML security
       // scan (ADIM 12.1 §Streaming XML scanner) + UTF-8 encoding gate (ADIM
-      // 12.2 §XML encoding). Nothing is buffered beyond the encoding prefix
-      // (≤ XML_ENCODING_PREFIX_MAX_BYTES ≈ 1 KiB) + one chunk + the scanner's
-      // ~40-byte overlap window.
+      // 12.2 §XML encoding) + raw-body archive writer (ADR-0017). Nothing
+      // is buffered beyond the encoding prefix (≤ XML_ENCODING_PREFIX_MAX_BYTES
+      // ≈ 1 KiB) + one chunk + the scanner's ~40-byte overlap window.
       const hasher = createHash('sha256');
       let total = 0;
       const isXml = input.format !== 'CSV';
@@ -380,7 +448,7 @@ export function createSafeFeedFetcher(opts: SafeFeedFetcherOptions): SafeFeedFet
 
       const body = response.body;
       if (!body) {
-        await closeActiveAgent();
+        await closeAndAbort();
         return {
           kind: 'failure',
           code: 'FETCH_FAILED',
@@ -401,7 +469,7 @@ export function createSafeFeedFetcher(opts: SafeFeedFetcherOptions): SafeFeedFet
             } catch {
               /* ignore */
             }
-            await closeActiveAgent();
+            await closeAndAbort();
             return {
               kind: 'failure',
               code: 'CONTENT_TOO_LARGE',
@@ -410,6 +478,28 @@ export function createSafeFeedFetcher(opts: SafeFeedFetcherOptions): SafeFeedFet
             };
           }
           hasher.update(chunk);
+          // Archive write happens in-lockstep with hashing so the SHA-256
+          // is guaranteed to be over the exact bytes archived (ADR-0017
+          // §Integrity).
+          if (writer) {
+            try {
+              await writer.write(chunk);
+            } catch (err) {
+              try {
+                await reader.cancel();
+              } catch {
+                /* ignore */
+              }
+              await closeAndAbort();
+              const msg = err instanceof Error ? err.message : String(err);
+              return {
+                kind: 'failure',
+                code: 'ARCHIVE_WRITE_FAILED',
+                errorMessage: `archive.write: ${msg}`,
+                httpStatus,
+              };
+            }
+          }
 
           if (isXml && !encodingChecked) {
             // Accumulate up to the prefix cap. Once we cross the threshold,
@@ -427,7 +517,7 @@ export function createSafeFeedFetcher(opts: SafeFeedFetcherOptions): SafeFeedFet
                 } catch {
                   /* ignore */
                 }
-                await closeActiveAgent();
+                await closeAndAbort();
                 if (err instanceof XmlEncodingError) {
                   return {
                     kind: 'rejected',
@@ -449,7 +539,7 @@ export function createSafeFeedFetcher(opts: SafeFeedFetcherOptions): SafeFeedFet
                 } catch {
                   /* ignore */
                 }
-                await closeActiveAgent();
+                await closeAndAbort();
                 if (err instanceof XmlSecurityError) {
                   return {
                     kind: 'rejected',
@@ -473,7 +563,7 @@ export function createSafeFeedFetcher(opts: SafeFeedFetcherOptions): SafeFeedFet
               } catch {
                 /* ignore */
               }
-              await closeActiveAgent();
+              await closeAndAbort();
               if (err instanceof XmlSecurityError) {
                 return {
                   kind: 'rejected',
@@ -486,7 +576,7 @@ export function createSafeFeedFetcher(opts: SafeFeedFetcherOptions): SafeFeedFet
           }
         }
       } catch (err) {
-        await closeActiveAgent();
+        await closeAndAbort();
         const msg = err instanceof Error ? err.message : String(err);
         return {
           kind: 'failure',
@@ -503,7 +593,7 @@ export function createSafeFeedFetcher(opts: SafeFeedFetcherOptions): SafeFeedFet
         try {
           assertUtf8XmlPrefix(prefix, contentTypeCharset);
         } catch (err) {
-          await closeActiveAgent();
+          await closeAndAbort();
           if (err instanceof XmlEncodingError) {
             return {
               kind: 'rejected',
@@ -516,7 +606,7 @@ export function createSafeFeedFetcher(opts: SafeFeedFetcherOptions): SafeFeedFet
         try {
           scanner!.update(prefix);
         } catch (err) {
-          await closeActiveAgent();
+          await closeAndAbort();
           if (err instanceof XmlSecurityError) {
             return {
               kind: 'rejected',
@@ -528,6 +618,30 @@ export function createSafeFeedFetcher(opts: SafeFeedFetcherOptions): SafeFeedFet
         }
       }
       scanner?.end();
+
+      // Finalize archive as the very last step so the visible archive
+      // object appears only for a truly successful fetch. If finalize
+      // fails, no ref is persisted — the caller (service) records a
+      // controlled failure instead of a bogus SUCCESS + ref.
+      let archiveRef: FeedArchiveRef | null = null;
+      if (writer) {
+        try {
+          archiveRef = await writer.finalize();
+        } catch (err) {
+          await closeActiveAgent();
+          // finalize's own catch already unlinks the tmp file; explicit
+          // abort is a no-op after a failed finalize.
+          const msg = err instanceof FeedArchiveError ? err.message
+            : err instanceof Error ? err.message : String(err);
+          return {
+            kind: 'failure',
+            code: 'ARCHIVE_WRITE_FAILED',
+            errorMessage: `archive.finalize: ${msg}`,
+            httpStatus,
+          };
+        }
+        writer = null;
+      }
       await closeActiveAgent();
 
       return {
@@ -538,6 +652,7 @@ export function createSafeFeedFetcher(opts: SafeFeedFetcherOptions): SafeFeedFet
         contentHash: hasher.digest('hex'),
         etag: etagHeader,
         lastModified: lastModifiedHeader,
+        archiveRef,
       };
     },
   };

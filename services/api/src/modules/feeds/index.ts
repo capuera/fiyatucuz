@@ -7,9 +7,29 @@
 export {
   loadFeedEnv,
   assertProductionFeedFetchSafety,
+  assertProductionFeedArchiveSafety,
   InsecureProductionFeedFetchError,
+  InsecureProductionFeedArchiveError,
   type FeedEnv,
 } from './env.js';
+
+export {
+  createFeedArchive,
+  resolveLocalArchiveRoot,
+  LocalFilesystemFeedArchive,
+  buildArchiveRef,
+  parseArchiveRef,
+  extForFormat,
+  FEED_ARCHIVE_SCHEME,
+  FeedArchiveError,
+  type FeedArchive,
+  type FeedArchiveExt,
+  type FeedArchiveErrorCode,
+  type FeedArchiveKey,
+  type FeedArchiveRef,
+  type FeedArchiveWriter,
+  type ParsedArchiveRef,
+} from './archive/index.js';
 
 export {
   createFeedService,

@@ -30,6 +30,7 @@ import {
 } from './modules/merchants/index.js';
 import {
   createFeedService,
+  loadFeedEnv,
   registerFeedRoutes,
   type FeedEnv,
   type FeedService,
@@ -38,7 +39,15 @@ import {
 export interface ServerDependencies {
   env: ApiEnv;
   authEnv: AuthEnv;
-  feedEnv: FeedEnv;
+  /**
+   * Feed / archive env. Optional here so unrelated test suites (auth,
+   * merchants, security) can boot the server without wiring feed config.
+   * When omitted, `loadFeedEnv({})` supplies safe dev defaults (no
+   * FEED_* env vars needed for those suites). Production entrypoints in
+   * src/index.ts always pass an explicit feedEnv and run the boot
+   * assertion.
+   */
+  feedEnv?: FeedEnv;
   logger: Logger;
   db: Db;
   jobs?: JobQueue;
@@ -150,10 +159,12 @@ export async function buildServer(deps: ServerDependencies) {
     logger: deps.logger,
   });
   // Feeds depend on the merchant service (site containment checks) + the
-  // JobQueue for background fetch execution — ADIM 12 / ADR-0016.
+  // JobQueue for background fetch execution — ADIM 12 / ADR-0016. Also
+  // owns the raw-body archive wiring — ADIM 13 / ADR-0017.
+  const feedEnv: FeedEnv = deps.feedEnv ?? loadFeedEnv({});
   const feedService: FeedService = createFeedService({
     db: deps.db,
-    env: deps.feedEnv,
+    env: feedEnv,
     merchants: merchantService,
     jobs,
     logger: deps.logger,

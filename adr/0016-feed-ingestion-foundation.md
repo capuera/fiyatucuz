@@ -44,10 +44,9 @@ A future append-only-first architecture could replace UPDATE with INSERT of a ne
 
 ### Raw feed storage
 
-`raw_archive_ref` is nullable. **This sprint stores NULL** — the raw body is streamed, hashed, and discarded. Object storage (S3 / Azure / MinIO) is deferred; introducing a cloud dependency for the fetch foundation would be premature. When we adopt one:
+`raw_archive_ref` is nullable. In this ADIM 12 sprint the raw body was streamed, hashed, and discarded — the column stored NULL. **ADIM 13 (ADR-0017) adds the archive layer**: a provider-independent `FeedArchive` abstraction with a local-filesystem adapter, wired into the fetcher's streaming loop. The column now stores an opaque `feed-archive://…` reference for successful fetches; failed / rejected fetches still store NULL.
 
-- The schema is ready (column exists).
-- A `FeedArchive` interface will land in a future sprint (`store(fetchId, stream) → ref`) with a `DiscardingArchive` default and one production implementation.
+Object storage (S3 / Azure / MinIO) adapters are still deferred — they slot in behind the abstraction without touching feed business logic.
 
 ### SSRF threat model + validation layers
 

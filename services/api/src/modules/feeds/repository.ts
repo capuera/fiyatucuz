@@ -193,3 +193,34 @@ export async function markFetchState(
     .returning();
   return rows[0] ?? null;
 }
+
+/**
+ * Atomically claim a QUEUED fetch for a worker by transitioning it to
+ * FETCHING. Returns the updated row on success, or `null` when the row is
+ * missing OR already in a non-QUEUED state (another worker won the race).
+ *
+ * Two concurrent `performFetch` calls previously both saw QUEUED, both
+ * marked FETCHING, and both proceeded with the fetch — since ADIM 13
+ * introduced the archive layer, the second worker would then fail with
+ * ARCHIVE_ALREADY_EXISTS on finalize. This atomic transition eliminates
+ * that race at the DB level.
+ */
+export async function claimFetchForWorker(
+  tx: Tx,
+  tenantId: string,
+  fetchId: string,
+  startedAt: Date,
+): Promise<FeedFetchRow | null> {
+  const rows = await tx
+    .update(feedFetches)
+    .set({ status: 'FETCHING', startedAt })
+    .where(
+      and(
+        eq(feedFetches.tenantId, tenantId),
+        eq(feedFetches.id, fetchId),
+        eq(feedFetches.status, 'QUEUED'),
+      ),
+    )
+    .returning();
+  return rows[0] ?? null;
+}
