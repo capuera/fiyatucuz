@@ -1,6 +1,8 @@
 import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 
+import { normalizeClientIp } from '../../lib/client-ip.js';
+
 import { clearAuthCookies, readRefreshCookie, readSessionCookie, setAuthCookies } from './cookies.js';
 import {
   InvalidCredentialsError,
@@ -75,9 +77,12 @@ function toEnvelope(sess: AuthSession): AuthResponseEnvelope {
 
 function requestMeta(request: FastifyRequest): { userAgent?: string; ipAddress?: string } {
   const ua = request.headers['user-agent'];
+  // request.ip may be "IP:port" or malformed behind a reverse proxy; only a
+  // bare, inet-safe address is recorded. Unparseable → column stays NULL.
+  const ip = normalizeClientIp(request.ip);
   return {
     ...(typeof ua === 'string' ? { userAgent: ua } : {}),
-    ...(request.ip ? { ipAddress: request.ip } : {}),
+    ...(ip !== null ? { ipAddress: ip } : {}),
   };
 }
 

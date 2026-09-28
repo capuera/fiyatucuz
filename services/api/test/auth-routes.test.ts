@@ -248,6 +248,91 @@ describe.skipIf(!reachable)('auth cookies: Secure follows AUTH_COOKIE_SECURE (AD
   });
 });
 
+describe.skipIf(!reachable)('auth — client IP recorded behind a reverse proxy (trustProxy=127.0.0.1)', () => {
+  // Production regression: IIS ARR sends X-Forwarded-For "IP:port"; Fastify
+  // returned it verbatim and the sessions.ip_address (inet) insert failed with
+  // 22P02, rolling back register/login.
+  const dbHandle = makeTestDbHandle();
+  const env = loadApiEnv({
+    NODE_ENV: 'test',
+    LOG_LEVEL: 'error',
+    API_HOST: '127.0.0.1',
+    API_TRUST_PROXY: '127.0.0.1',
+  });
+  const authEnv = loadAuthEnv({
+    AUTH_TOKEN_HMAC_SECRET: 'test_only_fixed_hmac_secret_at_least_32_chars_long_xxxxxxx',
+    AUTH_COOKIE_SECURE: 'false',
+  });
+  const serverPromise = buildServer({ env, authEnv, logger: createLogger(env), db: dbHandle.db });
+
+  async function sessionIps(): Promise<Array<string | null>> {
+    const rows = await dbHandle.sql<Array<{ ip: string | null }>>`
+      select host(ip_address) as ip from sessions order by created_at
+    `;
+    return rows.map((r) => r.ip);
+  }
+
+  beforeAll(async () => {
+    await truncateIdentityAndTenants(dbHandle.sql);
+    await serverPromise;
+  });
+  afterEach(async () => {
+    await truncateIdentityAndTenants(dbHandle.sql);
+  });
+  afterAll(async () => {
+    const server = await serverPromise;
+    await server.close();
+    await dbHandle.close();
+  });
+
+  it('register + login with XFF "IPv4:port" succeed and store the bare IPv4', async () => {
+    const server = await serverPromise;
+    const payload = { email: 'xff@example.com', password: 'ValidPass1!' };
+
+    const reg = await server.inject({
+      method: 'POST',
+      url: '/v1/auth/register',
+      headers: { 'x-forwarded-for': '203.0.113.10:60028' },
+      payload,
+    });
+    expect(reg.statusCode).toBe(201);
+
+    const login = await server.inject({
+      method: 'POST',
+      url: '/v1/auth/login',
+      headers: { 'x-forwarded-for': '203.0.113.10:60029' },
+      payload,
+    });
+    expect(login.statusCode).toBe(200);
+
+    expect(await sessionIps()).toEqual(['203.0.113.10', '203.0.113.10']);
+  });
+
+  it('XFF "[IPv6]:port" stores the bare IPv6', async () => {
+    const server = await serverPromise;
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/auth/register',
+      headers: { 'x-forwarded-for': '[2001:db8::1]:443' },
+      payload: { email: 'xff6@example.com', password: 'ValidPass1!' },
+    });
+    expect(res.statusCode).toBe(201);
+    expect(await sessionIps()).toEqual(['2001:db8::1']);
+  });
+
+  it('malformed XFF does not fail auth; ip_address is NULL', async () => {
+    const server = await serverPromise;
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/auth/register',
+      headers: { 'x-forwarded-for': 'not-an-ip:99999' },
+      payload: { email: 'xff-bad@example.com', password: 'ValidPass1!' },
+    });
+    expect(res.statusCode).toBe(201);
+    expect(await sessionIps()).toEqual([null]);
+  });
+});
+
 if (!reachable) {
   console.warn('[@fiyatucuz/api] auth-routes.test.ts: skipping — PG unreachable.');
 }

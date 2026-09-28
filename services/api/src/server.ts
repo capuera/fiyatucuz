@@ -10,6 +10,7 @@ import type { Logger } from 'pino';
 
 import type { ApiEnv } from './config/env.js';
 import { registerHealthRoutes } from './routes/health.js';
+import { clientIpRateLimitKey } from './lib/client-ip.js';
 import { InProcessJobQueue } from './lib/jobs/InProcessJobQueue.js';
 import { InProcessBroadcaster } from './lib/realtime/InProcessBroadcaster.js';
 import type { JobQueue } from './lib/jobs/JobQueue.js';
@@ -129,8 +130,12 @@ export async function buildServer(deps: ServerDependencies) {
     max: deps.env.RATE_LIMIT_AUTH_MAX,
     timeWindow: deps.env.RATE_LIMIT_AUTH_TIMEWINDOW,
     // Do not derive keys from headers we don't trust. When trustProxy is off
-    // request.ip is the socket peer; when on, it's the forwarded client IP.
-    keyGenerator: (req) => req.ip,
+    // request.ip is the socket peer; when on, it's the forwarded client IP —
+    // returned verbatim by Fastify, so it may carry a port (IIS ARR emits
+    // "IP:port") or be malformed. Normalize it; unparseable values fall back
+    // to a fixed per-socket-peer bucket, never the raw forwarded string. See
+    // lib/client-ip.ts.
+    keyGenerator: (req) => clientIpRateLimitKey(req.ip, req.socket.remoteAddress),
     enableDraftSpec: true,
   });
   if (!deps.env.RATE_LIMIT_ENABLED) {
