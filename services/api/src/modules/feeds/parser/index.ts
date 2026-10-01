@@ -1,13 +1,19 @@
 /**
- * Feed parser abstraction — foundation only (ADR-0016 §Parser abstraction).
+ * Feed parser registry (ADR-0016 §Parser abstraction, ADR-0018 §Streaming
+ * parse).
  *
- * Real domain-object mapping (products, offers) is DELIBERATELY deferred:
- * defining the catalog schema before the catalog sprint would prematurely
- * lock in choices we haven't earned. All parser implementations throw
- * `ParserNotImplementedError` for the mapping surface; only the security
- * preflight (`validateStream`) does real work here.
+ * Each parser offers a security preflight (`validate`) and a STREAMING item
+ * extractor factory (`createItemExtractor`). There is deliberately no
+ * whole-document `parse(text)` — feeds are never materialized in memory.
+ *
+ * XML formats (GOOGLE_MERCHANT_XML, CUSTOM_XML) produce raw items via the
+ * saxes-based {@link XmlItemExtractor}; the mapping decides which elements
+ * become offer fields. CSV import is deferred (ADIM 15) and still throws
+ * `ParserNotImplementedError`.
  */
 
+import type { FeedItemMapping } from '../import/mapping.js';
+import { XmlItemExtractor, type RawFeedItem, type XmlItemLimits } from '../import/xml-items.js';
 import type { FeedFormat } from '../repository.js';
 
 import { scanXmlSecurity, XmlSecurityError } from './xml-security.js';
@@ -30,7 +36,7 @@ export type ParserErrorCode =
 export class ParserNotImplementedError extends Error {
   readonly code = 'PARSER_NOT_IMPLEMENTED' as const;
   constructor(public readonly format: FeedFormat) {
-    super(`parser for ${format} produces no domain objects yet (ADIM 12)`);
+    super(`import for ${format} is not implemented yet`);
     this.name = 'ParserNotImplementedError';
   }
 }
@@ -61,11 +67,15 @@ export interface FeedParser {
    */
   validate(text: string): FeedValidationResult;
   /**
-   * Parse the full decoded content into domain objects. Deliberately not
-   * implemented in this sprint — throws `ParserNotImplementedError` so any
-   * accidental call from live code fails loudly.
+   * Streaming extractor: feed decoded text chunks, receive one raw item per
+   * mapped item element. Throws `ParserNotImplementedError` for formats whose
+   * import is not implemented (CSV).
    */
-  parse(text: string): never;
+  createItemExtractor(
+    mapping: FeedItemMapping,
+    limits: XmlItemLimits,
+    onItem: (item: RawFeedItem) => void,
+  ): XmlItemExtractor;
 }
 
 // ---------------------------------------------------------------------------
@@ -81,8 +91,12 @@ class XmlParserBase implements FeedParser {
     scanXmlSecurity(text);
     return { format: this.format, bytesScanned: text.length };
   }
-  parse(_text: string): never {
-    throw new ParserNotImplementedError(this.format);
+  createItemExtractor(
+    mapping: FeedItemMapping,
+    limits: XmlItemLimits,
+    onItem: (item: RawFeedItem) => void,
+  ): XmlItemExtractor {
+    return new XmlItemExtractor(mapping, limits, onItem);
   }
 }
 
@@ -96,7 +110,7 @@ class CsvFeedParser implements FeedParser {
     // concern that lives with the future domain-mapping implementation.
     return { format: 'CSV', bytesScanned: text.length };
   }
-  parse(_text: string): never {
+  createItemExtractor(): never {
     throw new ParserNotImplementedError('CSV');
   }
 }

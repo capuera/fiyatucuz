@@ -282,6 +282,69 @@ describe.skipIf(!reachable)('feeds: HTTP routes', () => {
     expect(res.statusCode).toBe(404);
   });
 
+  it('imports API: mapping validation, read-only import list, internals hidden, cross-tenant 404 (ADR-0018)', async () => {
+    const server = await serverPromise;
+    const alice = await registerAndBindTenant('imp-a');
+    const bob = await registerAndBindTenant('imp-b');
+    const { merchantId, siteId } = await createMerchantAndSite(alice, 'imp', 'imp.example');
+    const auth = { cookies: { fu_session: alice.sessionCookie }, headers: { [TENANT_HEADER]: alice.tenantId } };
+
+    const create = await server.inject({
+      method: 'POST',
+      url: `/v1/merchants/${merchantId}/sites/${siteId}/feeds`,
+      ...auth,
+      payload: { name: 'F', url: stubUrl, format: 'CUSTOM_XML' },
+    });
+    expect(create.statusCode).toBe(201);
+    const feedId = (create.json() as { id: string }).id;
+    const feedUrl = `/v1/merchants/${merchantId}/sites/${siteId}/feeds/${feedId}`;
+
+    // XPath-like / executable mapping paths are rejected at the boundary.
+    const bad = await server.inject({
+      method: 'PATCH',
+      url: feedUrl,
+      ...auth,
+      payload: { itemMapping: { itemElement: 'urun', fields: { externalId: '//kod', title: 'ad', price: 'fiyat', url: 'link' } } },
+    });
+    expect(bad.statusCode).toBe(400);
+
+    const good = await server.inject({
+      method: 'PATCH',
+      url: feedUrl,
+      ...auth,
+      payload: { itemMapping: { itemElement: 'item', fields: { externalId: 'id', title: 'title', price: 'price', url: 'link' } } },
+    });
+    expect(good.statusCode).toBe(200);
+    expect((good.json() as { itemMapping: { itemElement: string } }).itemMapping.itemElement).toBe('item');
+
+    // Fetch → SUCCESS → exactly one import (the stub feed has no items → FAILED NO_VALID_ITEMS).
+    expect((await server.inject({ method: 'POST', url: `${feedUrl}/fetch`, ...auth })).statusCode).toBe(202);
+    await (server.jobs as InProcessJobQueue).awaitIdle();
+
+    const list = await server.inject({ method: 'GET', url: `${feedUrl}/imports`, ...auth });
+    expect(list.statusCode).toBe(200);
+    const items = (list.json() as { items: Array<Record<string, unknown>> }).items;
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({ status: 'FAILED', errorCode: 'NO_VALID_ITEMS' });
+    expect(items[0]).not.toHaveProperty('claimToken');
+    expect(items[0]).not.toHaveProperty('leaseExpiresAt');
+
+    const one = await server.inject({ method: 'GET', url: `${feedUrl}/imports/${String(items[0]!.id)}`, ...auth });
+    expect(one.statusCode).toBe(200);
+    expect(
+      (await server.inject({ method: 'GET', url: `${feedUrl}/imports/${randomUUID()}`, ...auth })).statusCode,
+    ).toBe(404);
+
+    // Bob cannot see Alice's imports.
+    const cross = await server.inject({
+      method: 'GET',
+      url: `${feedUrl}/imports`,
+      cookies: { fu_session: bob.sessionCookie },
+      headers: { [TENANT_HEADER]: bob.tenantId },
+    });
+    expect(cross.statusCode).toBe(404);
+  });
+
   it('POST fetch on non-existent feed → 404', async () => {
     const server = await serverPromise;
     const authed = await registerAndBindTenant('nofeed');

@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
   CsvParser,
   CustomXmlParser,
+  GOOGLE_MERCHANT_PRESET,
   GoogleMerchantXmlParser,
   ParserNotImplementedError,
   parserFor,
@@ -23,10 +24,23 @@ describe('feeds: parser abstraction', () => {
     expect(() => parserFor('YAML' as never)).toThrow(UnsupportedFeedFormatError);
   });
 
-  it('every parser.parse throws ParserNotImplementedError (foundation only — no product rows)', () => {
-    expect(() => GoogleMerchantXmlParser.parse('<rss/>')).toThrow(ParserNotImplementedError);
-    expect(() => CustomXmlParser.parse('<x/>')).toThrow(ParserNotImplementedError);
-    expect(() => CsvParser.parse('a,b\n1,2\n')).toThrow(ParserNotImplementedError);
+  it('XML parsers create streaming item extractors; CSV import is not implemented (ADIM 14)', () => {
+    const limits = {
+      maxItems: 10,
+      maxFieldChars: 100,
+      maxDepth: 8,
+      maxElementsPerItem: 10,
+      maxAttributesPerElement: 4,
+    };
+    const items: unknown[] = [];
+    const x = GoogleMerchantXmlParser.createItemExtractor(GOOGLE_MERCHANT_PRESET, limits, (i) => items.push(i));
+    x.write('<rss><channel><item><g:id>1</g:id></item></channel></rss>');
+    x.close();
+    expect(items).toHaveLength(1);
+    expect(CustomXmlParser.createItemExtractor(GOOGLE_MERCHANT_PRESET, limits, () => {})).toBeDefined();
+    expect(() => CsvParser.createItemExtractor(GOOGLE_MERCHANT_PRESET, limits, () => {})).toThrow(
+      ParserNotImplementedError,
+    );
   });
 
   it('XML validate rejects DOCTYPE declarations', () => {

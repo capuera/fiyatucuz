@@ -109,6 +109,23 @@ export async function findMerchantSiteById(
   return rows[0] ?? null;
 }
 
+/**
+ * Site lookup by id within a tenant, without the merchant id — used by
+ * background jobs that start from a feed row (feeds.merchant_site_id).
+ */
+export async function findMerchantSiteByIdForTenant(
+  tx: Tx,
+  tenantId: string,
+  siteId: string,
+): Promise<MerchantSiteRow | null> {
+  const rows = await tx
+    .select()
+    .from(merchantSites)
+    .where(and(eq(merchantSites.tenantId, tenantId), eq(merchantSites.id, siteId)))
+    .limit(1);
+  return rows[0] ?? null;
+}
+
 export async function listMerchantSitesForMerchant(
   tx: Tx,
   tenantId: string,

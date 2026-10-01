@@ -6,9 +6,11 @@ import {
   MerchantSiteNotFoundError,
 } from '../merchants/index.js';
 
+import type { FeedImportRow } from './import/repository.js';
 import type { FeedFetchRow, FeedRow } from './repository.js';
 import {
   FeedFetchNotFoundError,
+  FeedImportNotFoundError,
   FeedNotFoundError,
   InvalidFeedUrlError,
   type FeedService,
@@ -74,6 +76,13 @@ function feedToEnvelope(row: FeedRow): FeedRow {
   return row;
 }
 
+// claim_token / lease_expires_at are worker-coordination internals; never
+// expose them on the wire.
+function importToEnvelope(row: FeedImportRow): Omit<FeedImportRow, 'claimToken' | 'leaseExpiresAt'> {
+  const { claimToken: _claimToken, leaseExpiresAt: _leaseExpiresAt, ...rest } = row;
+  return rest;
+}
+
 // ---------------------------------------------------------------------------
 // Plugin
 // ---------------------------------------------------------------------------
@@ -119,7 +128,8 @@ export const registerFeedRoutes: FastifyPluginAsync<FeedRoutesOptions> = async (
       err instanceof MerchantNotFoundError ||
       err instanceof MerchantSiteNotFoundError ||
       err instanceof FeedNotFoundError ||
-      err instanceof FeedFetchNotFoundError
+      err instanceof FeedFetchNotFoundError ||
+      err instanceof FeedImportNotFoundError
     ) {
       replyError(reply, err.httpStatus, err.code, err.message);
       return true;
@@ -298,6 +308,54 @@ export const registerFeedRoutes: FastifyPluginAsync<FeedRoutesOptions> = async (
           fetchId,
         );
         return reply.code(200).send(fetchToEnvelope(row));
+      } catch (err) {
+        if (mapError(err, reply)) return reply;
+        throw err;
+      }
+    },
+  );
+
+  // ---------- imports (read-only, ADR-0018) --------------------------------
+
+  server.get<{ Params: { merchantId: string; siteId: string; feedId: string } }>(
+    '/:merchantId/sites/:siteId/feeds/:feedId/imports',
+    async (request, reply) => {
+      const gate = requireAuthAndTenant(request, reply);
+      if (!gate) return reply;
+      const merchantId = requireUuidParam(reply, 'merchantId', request.params.merchantId);
+      if (!merchantId) return reply;
+      const siteId = requireUuidParam(reply, 'siteId', request.params.siteId);
+      if (!siteId) return reply;
+      const feedId = requireUuidParam(reply, 'feedId', request.params.feedId);
+      if (!feedId) return reply;
+      try {
+        const rows = await feedService.listImports(gate.tenantId, merchantId, siteId, feedId);
+        return reply.code(200).send({ items: rows.map(importToEnvelope) });
+      } catch (err) {
+        if (mapError(err, reply)) return reply;
+        throw err;
+      }
+    },
+  );
+
+  server.get<{
+    Params: { merchantId: string; siteId: string; feedId: string; importId: string };
+  }>(
+    '/:merchantId/sites/:siteId/feeds/:feedId/imports/:importId',
+    async (request, reply) => {
+      const gate = requireAuthAndTenant(request, reply);
+      if (!gate) return reply;
+      const merchantId = requireUuidParam(reply, 'merchantId', request.params.merchantId);
+      if (!merchantId) return reply;
+      const siteId = requireUuidParam(reply, 'siteId', request.params.siteId);
+      if (!siteId) return reply;
+      const feedId = requireUuidParam(reply, 'feedId', request.params.feedId);
+      if (!feedId) return reply;
+      const importId = requireUuidParam(reply, 'importId', request.params.importId);
+      if (!importId) return reply;
+      try {
+        const row = await feedService.getImport(gate.tenantId, merchantId, siteId, feedId, importId);
+        return reply.code(200).send(importToEnvelope(row));
       } catch (err) {
         if (mapError(err, reply)) return reply;
         throw err;

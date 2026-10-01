@@ -1,5 +1,7 @@
 import { z } from 'zod';
 
+import { FeedItemMappingSchema } from './import/mapping.js';
+
 export const UuidParamSchema = z.string().uuid();
 
 const feedFormats = ['GOOGLE_MERCHANT_XML', 'CUSTOM_XML', 'CSV'] as const;
@@ -11,6 +13,8 @@ export const CreateFeedBodySchema = z
     url: z.string().trim().min(3).max(2048),
     format: z.enum(feedFormats),
     fetchSchedule: z.string().trim().min(1).max(200).optional(),
+    // CUSTOM_XML item mapping (ADR-0018 §Mapping); ignored by other formats.
+    itemMapping: FeedItemMappingSchema.optional(),
   })
   .strict();
 
@@ -21,6 +25,7 @@ export const UpdateFeedBodySchema = z
     format: z.enum(feedFormats).optional(),
     status: z.enum(feedStatuses).optional(),
     fetchSchedule: z.string().trim().min(1).max(200).nullable().optional(),
+    itemMapping: FeedItemMappingSchema.nullable().optional(),
   })
   .strict();
 

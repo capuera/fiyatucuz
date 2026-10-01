@@ -16,6 +16,12 @@ import {
   type FetchResult,
   type SafeFeedFetcher,
 } from './fetcher.js';
+import {
+  createFeedImporter,
+  FeedImportNotFoundError,
+  type FeedImporter,
+} from './import/importer.js';
+import * as importRepo from './import/repository.js';
 import * as repo from './repository.js';
 import { SafeUrlError, validateSafeUrl } from './ssrf.js';
 import type { CreateFeedInput, UpdateFeedInput } from './validation.js';
@@ -52,13 +58,25 @@ export class InvalidFeedUrlError extends Error {
 }
 
 // Re-export merchant + fetcher errors so callers can `instanceof`-narrow.
-export { MerchantNotFoundError, MerchantSiteNotFoundError, FetchError, SafeUrlError };
+export {
+  MerchantNotFoundError,
+  MerchantSiteNotFoundError,
+  FetchError,
+  SafeUrlError,
+  FeedImportNotFoundError,
+};
 
 // ---------------------------------------------------------------------------
 // Service surface
 // ---------------------------------------------------------------------------
 
 export const FEED_FETCH_JOB = 'feed.fetch' as const;
+export const FEED_IMPORT_JOB = 'feed.import' as const;
+
+export interface FeedImportJobPayload {
+  readonly tenantId: string;
+  readonly importId: string;
+}
 
 export interface FeedFetchJobPayload {
   readonly tenantId: string;
@@ -126,7 +144,28 @@ export interface FeedService {
    */
   performFetch(tenantId: string, fetchId: string): Promise<repo.FeedFetchRow>;
 
-  /** Register the feed.fetch handler on the provided JobQueue. */
+  listImports(
+    tenantId: string,
+    merchantId: string,
+    siteId: string,
+    feedId: string,
+  ): Promise<readonly importRepo.FeedImportRow[]>;
+
+  getImport(
+    tenantId: string,
+    merchantId: string,
+    siteId: string,
+    feedId: string,
+    importId: string,
+  ): Promise<importRepo.FeedImportRow>;
+
+  /**
+   * Run a QUEUED import to a terminal state (ADR-0018). Called from the
+   * feed.import job; called directly from tests.
+   */
+  performImport(tenantId: string, importId: string): Promise<importRepo.FeedImportRow>;
+
+  /** Register the feed.fetch + feed.import handlers on the JobQueue. */
   registerJobHandlers(jobs: JobQueue): void;
 }
 
@@ -142,6 +181,8 @@ export interface FeedServiceDeps {
    * implementation.
    */
   readonly archive?: FeedArchive;
+  /** Injectable for tests; defaults to createFeedImporter over db/env/archive. */
+  readonly importer?: FeedImporter;
   readonly logger?: Logger;
 }
 
@@ -208,6 +249,8 @@ export function createFeedService(deps: FeedServiceDeps): FeedService {
   const { db, env, merchants, jobs, logger } = deps;
   const archive: FeedArchive = deps.archive ?? createFeedArchive(env);
   const fetcher: SafeFeedFetcher = deps.fetcher ?? createSafeFeedFetcher({ env, archive });
+  const importer: FeedImporter =
+    deps.importer ?? createFeedImporter({ db, env, archive, ...(logger ? { logger } : {}) });
 
   async function requireFeed(
     tx: Tx,
@@ -267,6 +310,7 @@ export function createFeedService(deps: FeedServiceDeps): FeedService {
           format: input.format,
           status: 'ACTIVE',
           fetchSchedule: input.fetchSchedule ?? null,
+          itemMapping: input.itemMapping ?? null,
         });
       });
     },
@@ -408,8 +452,12 @@ export function createFeedService(deps: FeedServiceDeps): FeedService {
         result = { kind: 'failure', code: 'FETCH_FAILED', errorMessage: msg };
       }
 
-      // Step 3: apply the terminal state + feed cursor.
-      return withTenantTransaction(db, tenantId, async (tx) => {
+      // Step 3: apply the terminal state + feed cursor. A SUCCESS fetch also
+      // gets its QUEUED import row in the SAME transaction (ADR-0018 §Import
+      // state): "fetch SUCCESS" and "import exists" commit atomically, and
+      // UNIQUE(fetch_id) keeps it to one import per fetch.
+      let queuedImportId: string | null = null;
+      const finalRow = await withTenantTransaction(db, tenantId, async (tx) => {
         const now = new Date();
         if (result.kind === 'success') {
           // rawArchiveRef is only set here — no code path before finalize
@@ -452,6 +500,13 @@ export function createFeedService(deps: FeedServiceDeps): FeedService {
             }
             throw new FeedFetchNotFoundError(fetchId);
           }
+          const queued = await importRepo.insertImportIfAbsent(tx, {
+            id: newId(),
+            tenantId,
+            feedId: feed.id,
+            fetchId,
+          });
+          queuedImportId = queued?.id ?? null;
           return updated;
         }
         if (result.kind === 'not_modified') {
@@ -490,6 +545,35 @@ export function createFeedService(deps: FeedServiceDeps): FeedService {
         if (!updated) throw new FeedFetchNotFoundError(fetchId);
         return updated;
       });
+
+      // Enqueue only after commit so the job can always see its row.
+      if (queuedImportId !== null) {
+        await jobs.enqueue<FeedImportJobPayload>({
+          name: FEED_IMPORT_JOB,
+          payload: { tenantId, importId: queuedImportId },
+        });
+      }
+      return finalRow;
+    },
+
+    async listImports(tenantId, merchantId, siteId, feedId) {
+      return withTenantTransaction(db, tenantId, async (tx) => {
+        await requireFeed(tx, tenantId, merchantId, siteId, feedId);
+        return importRepo.listImportsForFeed(tx, tenantId, feedId);
+      });
+    },
+
+    async getImport(tenantId, merchantId, siteId, feedId, importId) {
+      return withTenantTransaction(db, tenantId, async (tx) => {
+        await requireFeed(tx, tenantId, merchantId, siteId, feedId);
+        const row = await importRepo.findImportById(tx, tenantId, importId);
+        if (!row || row.feedId !== feedId) throw new FeedImportNotFoundError(importId);
+        return row;
+      });
+    },
+
+    async performImport(tenantId, importId) {
+      return importer.performImport(tenantId, importId);
     },
 
     registerJobHandlers(jobs: JobQueue) {
@@ -501,6 +585,9 @@ export function createFeedService(deps: FeedServiceDeps): FeedService {
         // The handler intentionally does not log the raw feed URL — the
         // service does that at INSERT/UPDATE time.
         await this.performFetch(job.payload.tenantId, job.payload.fetchId);
+      });
+      jobs.register<FeedImportJobPayload>(FEED_IMPORT_JOB, async (job: Job<FeedImportJobPayload>) => {
+        await this.performImport(job.payload.tenantId, job.payload.importId);
       });
     },
   };

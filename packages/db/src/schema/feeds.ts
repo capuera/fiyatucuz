@@ -4,6 +4,7 @@ import {
   foreignKey,
   index,
   integer,
+  jsonb,
   pgEnum,
   pgTable,
   text,
@@ -74,6 +75,11 @@ export const feeds = pgTable(
     }),
     etag: text('etag'),
     lastModified: text('last_modified'),
+    // Per-feed item mapping for CUSTOM_XML (ADR-0018 §Mapping). Validated by
+    // the API (zod) before it is stored; GOOGLE_MERCHANT_XML uses a code
+    // preset and ignores this column. Never interpreted as SQL, a path, or
+    // code — only as element/attribute names matched against parser events.
+    itemMapping: jsonb('item_mapping'),
     createdAt: timestamp('created_at', { withTimezone: true, mode: 'date' })
       .notNull()
       .default(sql`now()`),
@@ -90,6 +96,14 @@ export const feeds = pgTable(
     }).onDelete('restrict'),
     // Enables the composite FK from feed_fetches → feeds (id, tenant_id).
     idTenantUnique: unique('feeds_id_tenant_unique').on(t.id, t.tenantId),
+    // Enables the composite FK merchant_offers (feed_id, merchant_site_id,
+    // tenant_id) → feeds, so an offer's site always equals its feed's site
+    // (ADR-0018 §Ownership).
+    idSiteTenantUnique: unique('feeds_id_site_tenant_unique').on(
+      t.id,
+      t.merchantSiteId,
+      t.tenantId,
+    ),
     tenantIdIdx: index('feeds_tenant_id_idx').on(t.tenantId),
     merchantSiteIdIdx: index('feeds_merchant_site_id_idx').on(t.merchantSiteId),
     // Composite index tuned for the future scheduler (WHERE status='ACTIVE'
@@ -145,6 +159,14 @@ export const feedFetches = pgTable(
       columns: [t.feedId, t.tenantId],
       foreignColumns: [feeds.id, feeds.tenantId],
     }).onDelete('restrict'),
+    // Enables the composite FK feed_imports (fetch_id, feed_id, tenant_id) →
+    // feed_fetches, so an import can only reference a fetch of its own feed
+    // (ADR-0018 §Ownership). Added by 0006.
+    idFeedTenantUnique: unique('feed_fetches_id_feed_tenant_unique').on(
+      t.id,
+      t.feedId,
+      t.tenantId,
+    ),
     tenantIdIdx: index('feed_fetches_tenant_id_idx').on(t.tenantId),
     // Fetch-history query: WHERE feed_id = ? ORDER BY started_at DESC.
     feedStartedIdx: index('feed_fetches_feed_started_at_idx').on(t.feedId, t.startedAt),

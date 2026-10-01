@@ -9,3 +9,4 @@ export * from './identity.js';
 export * from './tenants.js';
 export * from './merchants.js';
 export * from './feeds.js';
+export * from './offers.js';

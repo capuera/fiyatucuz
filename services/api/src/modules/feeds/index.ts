@@ -34,14 +34,80 @@ export {
 export {
   createFeedService,
   FEED_FETCH_JOB,
+  FEED_IMPORT_JOB,
+  FeedImportNotFoundError,
   FeedNotFoundError,
   FeedFetchNotFoundError,
   InvalidFeedUrlError,
   type FeedService,
   type FeedServiceDeps,
   type FeedFetchJobPayload,
+  type FeedImportJobPayload,
   type EnqueueFetchResult,
 } from './service.js';
+
+// -- Import / normalization (ADR-0018) ---------------------------------------
+
+export {
+  FeedItemMappingSchema,
+  GOOGLE_MERCHANT_PRESET,
+  resolveFeedMapping,
+  mappingPaths,
+  type FeedItemMapping,
+  type FeedItemMappingInput,
+  type MappedField,
+  type OfferAvailability,
+  type DecimalSeparator,
+} from './import/mapping.js';
+export {
+  XmlItemExtractor,
+  XmlDocumentError,
+  type RawFeedItem,
+  type XmlItemLimits,
+} from './import/xml-items.js';
+export {
+  normalizeFeedItem,
+  contentHashOf,
+  OFFER_FIELD_LIMITS,
+  type NormalizedOffer,
+  type NormalizeResult,
+  type ItemIssue,
+} from './import/normalize/offer.js';
+export {
+  parsePrice,
+  parseAmountMinor,
+  splitPrice,
+  resolveCurrency,
+  SUPPORTED_CURRENCIES,
+} from './import/normalize/money.js';
+export { normalizeGtin } from './import/normalize/identifiers.js';
+export { normalizeProductUrl, normalizeImageUrl } from './import/normalize/url.js';
+export { normalizeText, truncateCodePoints, codePointLength } from './import/normalize/text.js';
+export {
+  normalizeAvailability,
+  normalizeStock,
+  normalizeVatRateBp,
+  normalizeBoolean,
+} from './import/normalize/attributes.js';
+export {
+  assertArchiveRefMatches,
+  verifyArchiveIntegrity,
+  streamVerifiedXmlText,
+  type ExpectedArchive,
+} from './import/verified-archive.js';
+export { ImportError, ImportLeaseLostError, type ImportErrorCode } from './import/errors.js';
+export {
+  createFeedImporter,
+  type FeedImporter,
+  type FeedImporterDeps,
+} from './import/importer.js';
+export type {
+  FeedImportRow,
+  FeedImportStatus,
+  ImportCounters,
+  ImportErrorSample,
+} from './import/repository.js';
+export * as feedImportsRepository from './import/repository.js';
 
 export {
   createSafeFeedFetcher,

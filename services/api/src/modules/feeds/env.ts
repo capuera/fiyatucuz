@@ -29,6 +29,23 @@ const FeedEnvSchema = z.object({
   FEED_FETCH_ALLOW_PRIVATE_ADDRESSES: BooleanishSchema.default(false),
   FEED_ARCHIVE_DRIVER: z.enum(['local']).default('local'),
   FEED_ARCHIVE_LOCAL_ROOT: z.string().min(1).optional(),
+  // -- Import / normalization bounds (ADR-0018 §Bounded processing) ---------
+  /** Offers upserted per DB transaction. */
+  FEED_IMPORT_BATCH_SIZE: z.coerce.number().int().min(1).max(5000).default(500),
+  /** Items per document; exceeding it fails the import (no deactivation). */
+  FEED_IMPORT_MAX_ITEMS: z.coerce.number().int().min(1).max(5_000_000).default(500_000),
+  /** Raw characters captured per mapped field before it is flagged oversize. */
+  FEED_IMPORT_MAX_FIELD_CHARS: z.coerce.number().int().min(256).max(1_000_000).default(65_536),
+  /** Maximum XML element nesting depth anywhere in the document. */
+  FEED_IMPORT_MAX_DEPTH: z.coerce.number().int().min(4).max(256).default(32),
+  /** Maximum elements inside one item; beyond it the item is rejected. */
+  FEED_IMPORT_MAX_ELEMENTS_PER_ITEM: z.coerce.number().int().min(8).max(100_000).default(500),
+  /** Maximum attributes on one element inside an item. */
+  FEED_IMPORT_MAX_ATTRIBUTES_PER_ELEMENT: z.coerce.number().int().min(1).max(1024).default(32),
+  /** Rejection/warning samples persisted on feed_imports.error_samples. */
+  FEED_IMPORT_MAX_ERROR_SAMPLES: z.coerce.number().int().min(0).max(1000).default(50),
+  /** Worker lease; an expired PROCESSING import can be taken over. */
+  FEED_IMPORT_LEASE_MS: z.coerce.number().int().min(1000).max(3_600_000).default(300_000),
 });
 
 export type FeedEnv = z.infer<typeof FeedEnvSchema>;
