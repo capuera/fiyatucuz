@@ -18,10 +18,28 @@ export {
   applyMigrations,
   ensureMigrationsTable,
   listAppliedMigrations,
+  listMigrationFiles,
+  getMigrationStatus,
+  readMigrationTarget,
+  assertExpectedDatabase,
+  MigrationTargetMismatchError,
   MIGRATIONS_TABLE,
   type AppliedMigration,
   type MigrationRunResult,
+  type MigrationStatus,
+  type MigrationTarget,
 } from './migrator.js';
+export {
+  loadMigrationDbEnv,
+  MigrationEnvError,
+  MIGRATION_URL_VAR,
+  MIGRATION_EXPECTED_DB_VAR,
+  MIGRATION_POOL_MAX,
+  redactSecrets,
+  secretsOfDatabaseUrl,
+  describeError,
+  type MigrationDbEnv,
+} from './migration-env.js';
 export {
   loadReportingDbEnv,
   createReportingHandle,

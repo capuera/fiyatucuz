@@ -1,38 +1,28 @@
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { createDbHandle } from '../client.js';
-import { loadDbEnv } from '../env.js';
-import { applyMigrations } from '../migrator.js';
+import { runMigrationCli } from './run-migrations.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 // From src/cli/  and dist/cli/ alike, `../../drizzle` resolves to
 // packages/db/drizzle/ — the hand-written migration folder.
 const MIGRATIONS_DIR = resolve(HERE, '..', '..', 'drizzle');
 
-async function main(): Promise<void> {
-  const env = loadDbEnv();
-  const handle = createDbHandle(env);
-  try {
-    const result = await applyMigrations(handle.sql, MIGRATIONS_DIR);
-    if (result.applied.length === 0) {
-      console.warn(
-        `[db:migrate] Nothing to apply. ${result.skipped.length} migration(s) already recorded.`,
-      );
-    } else {
-      for (const id of result.applied) {
-        console.warn(`[db:migrate] Applied ${id}`);
-      }
-      console.warn(
-        `[db:migrate] Done: ${result.applied.length} applied, ${result.skipped.length} skipped.`,
-      );
-    }
-  } finally {
-    await handle.close();
-  }
-}
-
-void main().catch((err) => {
-  console.error('[db:migrate] failed:', err);
-  process.exit(1);
-});
+// Connection: DATABASE_MIGRATION_URL + DATABASE_MIGRATION_EXPECTED_DB only;
+// DATABASE_URL (API runtime credential) is never used. See migration-env.ts.
+void runMigrationCli({
+  argv: process.argv.slice(2),
+  env: process.env,
+  migrationsDir: MIGRATIONS_DIR,
+}).then(
+  (code) => {
+    process.exitCode = code;
+  },
+  () => {
+    // runMigrationCli handles its own errors; this only guarantees that an
+    // unexpected rejection never reaches Node's default handler, which would
+    // print the raw error object (unsanitized).
+    process.stderr.write('[db:migrate] failed: unexpected error\n');
+    process.exitCode = 1;
+  },
+);

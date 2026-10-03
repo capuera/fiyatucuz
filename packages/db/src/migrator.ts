@@ -63,8 +63,7 @@ export async function listAppliedMigrations(sql: Sql): Promise<AppliedMigration[
 export async function applyMigrations(sql: Sql, dir: string): Promise<MigrationRunResult> {
   await ensureMigrationsTable(sql);
 
-  const entries = await readdir(dir);
-  const files = entries.filter((f) => f.endsWith('.sql')).sort();
+  const files = await listMigrationFiles(dir);
 
   const rows = await sql<{ id: string }[]>`select id from ${sql(MIGRATIONS_TABLE)}`;
   const already = new Set(rows.map((r) => r.id));
@@ -86,4 +85,87 @@ export async function applyMigrations(sql: Sql, dir: string): Promise<MigrationR
   }
 
   return { applied, skipped };
+}
+
+/** Migration file IDs in `dir`, in application (lexicographic) order. */
+export async function listMigrationFiles(dir: string): Promise<string[]> {
+  const entries = await readdir(dir);
+  return entries.filter((f) => f.endsWith('.sql')).sort();
+}
+
+export interface MigrationStatus {
+  /** False when the tracking table does not exist yet (fresh database). */
+  readonly trackingTableExists: boolean;
+  /** Files already recorded as applied, in file order. */
+  readonly applied: readonly string[];
+  /** Files not yet recorded, in the order they would be applied. */
+  readonly pending: readonly string[];
+  /** Recorded IDs with no matching file in `dir` (e.g. an older checkout). */
+  readonly unknownApplied: readonly string[];
+}
+
+/**
+ * Read-only migration status (ADIM 15A-1). Runs inside a READ ONLY
+ * transaction, never calls {@link ensureMigrationsTable}, and resolves the
+ * tracking table the same way the migrator does (unqualified name via the
+ * session search_path) using `to_regclass`, which does not create anything.
+ * A missing tracking table reports every file as pending.
+ */
+export async function getMigrationStatus(sql: Sql, dir: string): Promise<MigrationStatus> {
+  const files = await listMigrationFiles(dir);
+  const recorded = await sql.begin('read only', async (tx) => {
+    const exists = await tx<{ present: boolean }[]>`
+      select to_regclass(${MIGRATIONS_TABLE}::text) is not null as present
+    `;
+    if (!exists[0]?.present) return null;
+    const rows = await tx<{ id: string }[]>`select id from ${tx(MIGRATIONS_TABLE)} order by id`;
+    return rows.map((r) => r.id);
+  });
+
+  if (recorded === null) {
+    return { trackingTableExists: false, applied: [], pending: files, unknownApplied: [] };
+  }
+  const recordedSet = new Set(recorded);
+  const fileSet = new Set(files);
+  return {
+    trackingTableExists: true,
+    applied: files.filter((f) => recordedSet.has(f)),
+    pending: files.filter((f) => !recordedSet.has(f)),
+    unknownApplied: recorded.filter((id) => !fileSet.has(id)),
+  };
+}
+
+export interface MigrationTarget {
+  readonly database: string;
+  readonly user: string;
+  readonly serverVersion: string;
+}
+
+/** Identity of the connected database (no credentials involved). */
+export async function readMigrationTarget(sql: Sql): Promise<MigrationTarget> {
+  const rows = await sql<{ database: string; user: string; server_version: string }[]>`
+    select current_database() as database,
+           current_user as user,
+           current_setting('server_version') as server_version
+  `;
+  const row = rows[0];
+  if (!row) throw new Error('could not read current_database()');
+  return { database: row.database, user: row.user, serverVersion: row.server_version };
+}
+
+export class MigrationTargetMismatchError extends Error {
+  constructor(
+    public readonly expected: string,
+    public readonly connected: string,
+  ) {
+    super(`Expected database: ${expected}; Connected database: ${connected}. Nothing was changed.`);
+    this.name = 'MigrationTargetMismatchError';
+  }
+}
+
+/** Exact (case-sensitive) match, as PostgreSQL reports the name. */
+export function assertExpectedDatabase(target: MigrationTarget, expected: string): void {
+  if (target.database !== expected) {
+    throw new MigrationTargetMismatchError(expected, target.database);
+  }
 }

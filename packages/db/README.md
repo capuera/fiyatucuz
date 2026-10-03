@@ -84,6 +84,8 @@ so it is safe under pgBouncer transaction pooling.
 | `DATABASE_MAX_LIFETIME_SECONDS` | `1800` | Recycle connections to survive PgBouncer/PG restarts cleanly. |
 | `DATABASE_PREPARED_STATEMENTS` | `false` | **Keep false for pgBouncer transaction mode.** Enable only when connecting direct-to-Postgres. |
 | `DATABASE_SSL` | `false` | Set `require` in staging/prod. |
+| `DATABASE_MIGRATION_URL` | *required by the migration CLI only* | Migration-only credential (`loadMigrationDbEnv`). **No fallback to `DATABASE_URL`** in any environment; the API runtime never reads it. Pool is pinned to 1 connection. |
+| `DATABASE_MIGRATION_EXPECTED_DB` | *required by the migration CLI only* | Wrong-target protection: the CLI aborts before reading or changing anything unless `current_database()` equals this value. |
 | `REPORTING_DATABASE_URL` | *required by `loadReportingDbEnv` only* | Separate URL for the reporting/BYPASSRLS role. `loadReportingDbEnv` hard-fails if missing; **no silent fallback** to `DATABASE_URL`. |
 
 ## Migrations
@@ -91,10 +93,41 @@ so it is safe under pgBouncer transaction pooling.
 FiyatUcuz migrations are **hand-written** SQL — extensions, roles, RLS policies, and partitioned tables are not expressible via Drizzle diff. Files live in `packages/db/drizzle/*.sql` and are applied in ascending filename order by our custom runner.
 
 ```bash
-pnpm --filter @fiyatucuz/db db:migrate     # apply pending migrations
-pnpm --filter @fiyatucuz/db db:generate    # (future) diff current schema → new SQL
-pnpm --filter @fiyatucuz/db db:studio      # local schema browser
+pnpm --filter @fiyatucuz/db db:migrate:status  # read-only: applied / pending
+pnpm --filter @fiyatucuz/db db:migrate         # apply pending migrations
+pnpm --filter @fiyatucuz/db db:generate        # (future) diff current schema → new SQL
+pnpm --filter @fiyatucuz/db db:studio          # local schema browser
 ```
+
+**Credentials.** The migration CLI connects with `DATABASE_MIGRATION_URL` and
+requires `DATABASE_MIGRATION_EXPECTED_DB`; it never uses `DATABASE_URL` (the API
+runtime credential, which deliberately has no DDL rights). In development the
+`db:migrate*` scripts load `services/api/.env`, so add both variables there
+(they may point at the same local database as `DATABASE_URL`).
+
+**Production principle.** The migration credential is not the runtime
+credential and must not live in the API's env file. The compiled CLI runs
+without dev tooling:
+
+```bash
+node --env-file=<migration env file> packages/db/dist/cli/migrate.js --status
+node --env-file=<migration env file> packages/db/dist/cli/migrate.js
+```
+
+**Safety contract** (`src/cli/run-migrations.ts`): validate env → connect →
+verify `current_database()` → only then read status or apply. A mismatch exits
+`1` with "Expected database / Connected database" and changes nothing.
+Failure output contains no URL or password (`describeError`, `redactSecrets`).
+
+| Exit code | Meaning |
+|---|---|
+| `0` | Success. For `--status`, pending migrations are **not** an error. |
+| `1` | Configuration, connection, target-database or migration failure. |
+| `2` | Invalid arguments. |
+
+`--status` is read-only: it runs in a `READ ONLY` transaction, never creates the
+tracking table (`to_regclass` lookup) and reports every file as pending when the
+table does not exist yet.
 
 Every migration file must be **idempotent** (`CREATE ... IF NOT EXISTS`, `DO $$ IF NOT EXISTS ... $$`). Each file runs inside its own transaction opened by the migrator — do not add `BEGIN`/`COMMIT`. See ADR-0012 §Migration mechanism.
 

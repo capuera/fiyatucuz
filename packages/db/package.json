@@ -26,6 +26,7 @@
     "test:watch": "vitest",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "tsx --env-file-if-exists=../../services/api/.env src/cli/migrate.ts",
+    "db:migrate:status": "tsx --env-file-if-exists=../../services/api/.env src/cli/migrate.ts --status",
     "db:check": "drizzle-kit check",
     "db:studio": "drizzle-kit studio"
   },

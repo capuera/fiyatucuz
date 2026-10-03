@@ -26,8 +26,15 @@ contributing schemas via `packages/db/src/schema/index.ts` (see ADR-0012).
 ```bash
 pnpm --filter @fiyatucuz/db db:generate   # diff schema → new SQL migration
 pnpm --filter @fiyatucuz/db db:migrate    # apply pending migrations
+pnpm --filter @fiyatucuz/db db:migrate:status  # read-only: applied / pending
 pnpm --filter @fiyatucuz/db db:check      # verify migration graph integrity
 pnpm --filter @fiyatucuz/db db:studio     # local schema browser
 ```
 
-All commands require `DATABASE_URL` in the environment.
+Credentials differ per command:
+
+- `db:migrate` / `db:migrate:status` require `DATABASE_MIGRATION_URL` (migration-only
+  credential) and `DATABASE_MIGRATION_EXPECTED_DB` (wrong-target guard). They never
+  fall back to `DATABASE_URL`.
+- `DATABASE_URL` is the API runtime credential; only the drizzle-kit commands
+  (`db:generate`, `db:check`, `db:studio`) read it, via `drizzle.config.ts`.
