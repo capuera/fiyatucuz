@@ -2,6 +2,13 @@ import { readdir, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import type { Sql } from './client.js';
+import {
+  holdsMigrationLock,
+  MigrationLockLostError,
+  MigrationLockUnavailableError,
+  releaseMigrationLock,
+  tryAcquireMigrationLock,
+} from './migration-lock.js';
 
 /**
  * The tracking table that records which foundation/domain migrations have
@@ -53,19 +60,44 @@ export async function listAppliedMigrations(sql: Sql): Promise<AppliedMigration[
  * like `0001_foundation.sql`, `0002_identity.sql`, etc.
  *
  * Each migration runs in its own transaction so a mid-migration failure
- * rolls back cleanly. Do NOT add BEGIN / COMMIT to the migration file
- * itself — the migrator owns the transaction boundary.
+ * rolls back cleanly. The whole run holds the migration advisory lock
+ * (ADR-0019): a concurrent runner fails fast with
+ * MigrationLockUnavailableError and applies nothing. Do NOT add BEGIN /
+ * COMMIT to the migration file itself — the migrator owns the transaction
+ * boundary.
  *
  * Migrations that must run outside a transaction (e.g. CREATE INDEX
  * CONCURRENTLY) are not supported by this runner in this form; they will get
  * a dedicated code path when the first such migration lands.
  */
 export async function applyMigrations(sql: Sql, dir: string): Promise<MigrationRunResult> {
-  await ensureMigrationsTable(sql);
+  // Everything runs on ONE reserved connection: the migration advisory lock
+  // is session-scoped, so lock ownership and every migration statement must
+  // share a backend (a pooled `sql` may route queries to different sessions,
+  // or recycle the connection). See migration-lock.ts / ADR-0019.
+  const conn = await sql.reserve();
+  try {
+    if (!(await tryAcquireMigrationLock(conn))) {
+      throw new MigrationLockUnavailableError();
+    }
+    try {
+      return await applyMigrationsLocked(conn, dir);
+    } finally {
+      // Explicit release; if the session is already gone PostgreSQL has
+      // released it. Never mask the original migration error.
+      await releaseMigrationLock(conn).catch(() => {});
+    }
+  } finally {
+    conn.release();
+  }
+}
+
+async function applyMigrationsLocked(conn: Sql, dir: string): Promise<MigrationRunResult> {
+  await ensureMigrationsTable(conn);
 
   const files = await listMigrationFiles(dir);
 
-  const rows = await sql<{ id: string }[]>`select id from ${sql(MIGRATIONS_TABLE)}`;
+  const rows = await conn<{ id: string }[]>`select id from ${conn(MIGRATIONS_TABLE)}`;
   const already = new Set(rows.map((r) => r.id));
 
   const applied: string[] = [];
@@ -77,10 +109,22 @@ export async function applyMigrations(sql: Sql, dir: string): Promise<MigrationR
       continue;
     }
     const body = await readFile(join(dir, file), 'utf8');
-    await sql.begin(async (tx) => {
-      await tx.unsafe(body);
-      await tx`insert into ${tx(MIGRATIONS_TABLE)} (id) values (${file})`;
-    });
+    // One transaction per file: migration SQL + tracking INSERT commit or
+    // roll back together. Explicit BEGIN/COMMIT because a reserved
+    // connection has no `.begin()` at runtime in postgres.js 3.4 (its types
+    // claim otherwise); postgres.js permits BEGIN on reserved connections.
+    await conn`begin`;
+    try {
+      // Same session as the lock holder? A recycled connection would have
+      // silently lost the lock — refuse to continue in that case.
+      if (!(await holdsMigrationLock(conn))) throw new MigrationLockLostError();
+      await conn.unsafe(body);
+      await conn`insert into ${conn(MIGRATIONS_TABLE)} (id) values (${file})`;
+      await conn`commit`;
+    } catch (err) {
+      await conn`rollback`.catch(() => {});
+      throw err;
+    }
     applied.push(file);
   }
 

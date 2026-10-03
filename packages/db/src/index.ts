@@ -30,6 +30,15 @@ export {
   type MigrationTarget,
 } from './migrator.js';
 export {
+  tryAcquireMigrationLock,
+  holdsMigrationLock,
+  releaseMigrationLock,
+  MigrationLockUnavailableError,
+  MigrationLockLostError,
+  MIGRATION_LOCK_NAMESPACE,
+  MIGRATION_LOCK_RESOURCE,
+} from './migration-lock.js';
+export {
   loadMigrationDbEnv,
   MigrationEnvError,
   MIGRATION_URL_VAR,

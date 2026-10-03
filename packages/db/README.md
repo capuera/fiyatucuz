@@ -127,7 +127,18 @@ Failure output contains no URL or password (`describeError`, `redactSecrets`).
 
 `--status` is read-only: it runs in a `READ ONLY` transaction, never creates the
 tracking table (`to_regclass` lookup) and reports every file as pending when the
-table does not exist yet.
+table does not exist yet. It takes no lock, so it is safe during a migration.
+
+**Exclusive apply.** Applying holds a PostgreSQL session advisory lock for the
+whole run (`pg_try_advisory_lock`, key `"FYAU"`/1) on one reserved connection.
+A concurrent runner fails fast with "another migration process is already
+running" (exit `1`) and changes nothing. Each file still commits or rolls back
+together with its tracking row.
+
+**Authoring policy.** Schema changes follow expand/contract so the previous
+release keeps working after a deploy; destructive or breaking changes (DROP,
+RENAME, incompatible type changes, tightening NOT NULL/CHECK) ship in a later,
+separate release. See [ADR-0019](../../adr/0019-production-database-migration-safety.md).
 
 Every migration file must be **idempotent** (`CREATE ... IF NOT EXISTS`, `DO $$ IF NOT EXISTS ... $$`). Each file runs inside its own transaction opened by the migrator — do not add `BEGIN`/`COMMIT`. See ADR-0012 §Migration mechanism.
 
