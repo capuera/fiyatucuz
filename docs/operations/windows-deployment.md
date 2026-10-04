@@ -10,7 +10,13 @@ Design: [ADR-0021](../../adr/0021-windows-deployment-activation-and-rollback.md)
 | WINDOWS VERIFIED           | **No — NOT VERIFIED / DEFERRED TO 15A-7**               |
 | PRODUCTION APPROVED        | **No — requires 15A-7 and 15A-P**                       |
 
-> Do **not** run these scripts against `C:\FiyatUcuz` on the production host before 15A-7 (Windows verification on a non-production host) and 15A-P (production cutover approval). The commands below describe the intended procedure only.
+> **The tooling existing in Git does NOT authorize production use.** Production use requires a successful 15A-7, ADR-0021 accepted after it, an approved 15A-P cutover and a per-deployment approval record — see the [production operations standard](production-operations-standard.md#2-production-authorization). Until then the commands below are for **Windows staging** (a separate, non-production machine; never the production server).
+
+Operations documents:
+
+- [production-operations-standard.md](production-operations-standard.md) — environments, change classes, approval, evidence, backup, rollback, secrets, retention, emergency
+- [production-deployment-checklist.md](production-deployment-checklist.md) — per-deployment record and GO/NO-GO gates
+- [incident-recovery.md](incident-recovery.md) — response per outcome status
 
 ## Layout
 
@@ -46,19 +52,76 @@ C:\FiyatUcuz\
 | `scripts/deploy/windows/Deploy-FiyatUcuzApi.ps1`     | `-Phase Prepare` / `-Phase Activate`                            |
 | `scripts/deploy/windows/Rollback-FiyatUcuzApi.ps1`   | Manual application rollback                                     |
 | `scripts/deploy/windows/FiyatUcuzApi.xml.template`   | WinSW config template (applied in 15A-P)                        |
-| `scripts/deploy/test/deploy.test.mjs`                | Tests (`node --test scripts/deploy/test/deploy.test.mjs`)       |
+| `scripts/deploy/test/deploy.test.mjs`                | Tests (`node:test`; development machine only)                   |
 
 The tooling runs from a **separate checkout** (`-ToolsRoot`) of the same commit; `scripts/` is not part of the release artifact.
 
-## Procedure (intended; not yet approved for production)
+## Procedure
 
-1. **Build the artifact** on the build machine (ADR-0020): `node scripts/release/api-release.mjs prepare …`, archive with `tar -czf`, record archive SHA-256 and manifest SHA-256.
-2. **Preflight** (read-only): `Test-FiyatUcuzPreflight.ps1 -ToolsRoot <tools>`.
-3. **Prepare**: `Deploy-FiyatUcuzApi.ps1 -Phase Prepare -ToolsRoot <tools> -Archive <tgz> -ArchiveSha256 <hex> -ManifestSha256 <hex>`. Prints the release id and the **seal SHA-256**. Production is unchanged.
-4. **Review migrations**: run `deploy-cli.mjs migration --mode status …` (or read the Activate receipt) and review every pending SQL file for ADR-0019 expand-only compatibility. The tool does not and cannot prove this.
-5. **Activate**: `Deploy-FiyatUcuzApi.ps1 -Phase Activate -ToolsRoot <tools> -ReleaseId <id> -SealSha256 <hex> [-PgDump <pg_dump.exe> -PgRestore <pg_restore.exe> -ReviewedMigrations <a.sql>,<b.sql>]`.
-6. **External check**: `https://api.fiyatucuz.com/health` from outside the host (operator; not a tool gate).
-7. **Retention**: `deploy-cli.mjs retention-report --releases C:\FiyatUcuz\releases --protect <current>,<prev>` — report only; any deletion is manual.
+### Command conventions
+
+- Every command is labelled `[STAGING]` or `[PRODUCTION]` **and** `[READ-ONLY]` or `[MUTATING]`. The tooling has no environment marker (gap G7): the environment is the machine you are on. Check the machine name before every `[MUTATING]` command.
+- Commands pass `-Root C:\FiyatUcuz` explicitly. The staging machine mirrors the production layout, so the labels and the machine — not the path — distinguish the environments.
+- `<…>` placeholders (`<TOOLS_ROOT>`, `<RELEASE_ID>`, …) must be replaced; PowerShell refuses to run them unchanged. `<TOOLS_ROOT>` is a separate checkout of the **same commit** as the release.
+- Run in an elevated Windows PowerShell 5.1.
+
+### Steps (Windows staging)
+
+1. **Build the artifact** on the build machine as described in [`scripts/release/README.md`](../../scripts/release/README.md); record the 40-char commit, the manifest SHA-256 and the archive SHA-256.
+2. **Preflight** — changes nothing:
+
+   ```powershell
+   # [STAGING] [READ-ONLY] preflight
+   & <TOOLS_ROOT>\scripts\deploy\windows\Test-FiyatUcuzPreflight.ps1 -Root C:\FiyatUcuz -ToolsRoot <TOOLS_ROOT>
+   ```
+
+3. **Prepare** — creates `releases\<id>` and its seal; never touches the service or the activation junctions. Prints the release ID and the **seal SHA-256**:
+
+   ```powershell
+   # [STAGING] [MUTATING] prepare (release directory + seal only)
+   & <TOOLS_ROOT>\scripts\deploy\windows\Deploy-FiyatUcuzApi.ps1 -Phase Prepare -Root C:\FiyatUcuz -ToolsRoot <TOOLS_ROOT> -Archive <ARCHIVE_TGZ> -ArchiveSha256 <ARCHIVE_SHA256> -ManifestSha256 <MANIFEST_SHA256>
+   ```
+
+4. **Review migrations** — read-only status, then a human review of every pending SQL file ([standard §6](production-operations-standard.md#6-migration-review-standard)). The tool does not and cannot prove that SQL is expand-only. Until gap G2 is fixed, also run the raw status command from the [checklist](production-deployment-checklist.md#read-only-verification-commands) to see "recorded but missing from this checkout" entries.
+
+   ```powershell
+   # [STAGING] [READ-ONLY] migration status of the prepared release (no lock, no changes)
+   & C:\FiyatUcuz\runtime\node22\node.exe <TOOLS_ROOT>\scripts\deploy\deploy-cli.mjs migration --mode status --node C:\FiyatUcuz\runtime\node22\node.exe --cli C:\FiyatUcuz\releases\<RELEASE_ID>\packages\db\dist\cli\migrate.js --env-file C:\FiyatUcuz\config\migration.env
+   ```
+
+5. **Activate** — backup and migration when pending, then the junction swap and service restart:
+
+   ```powershell
+   # [STAGING] [MUTATING] activate (no pending migrations)
+   & <TOOLS_ROOT>\scripts\deploy\windows\Deploy-FiyatUcuzApi.ps1 -Phase Activate -Root C:\FiyatUcuz -ToolsRoot <TOOLS_ROOT> -ReleaseId <RELEASE_ID> -SealSha256 <SEAL_SHA256>
+
+   # [STAGING] [MUTATING] activate (pending migrations: backup + reviewed migrations)
+   & <TOOLS_ROOT>\scripts\deploy\windows\Deploy-FiyatUcuzApi.ps1 -Phase Activate -Root C:\FiyatUcuz -ToolsRoot <TOOLS_ROOT> -ReleaseId <RELEASE_ID> -SealSha256 <SEAL_SHA256> -PgDump <PG_DUMP_EXE> -PgRestore <PG_RESTORE_EXE> -ReviewedMigrations <MIGRATION_1>,<MIGRATION_2>
+   ```
+
+6. **Verify** — the post-deployment checks in the [checklist](production-deployment-checklist.md#gate-4--post-deployment-go), including a database-reading smoke test and external HTTPS health from outside the server.
+7. **Retention report** — advisory only; nothing is deleted:
+
+   ```powershell
+   # [STAGING] [READ-ONLY] retention report
+   & C:\FiyatUcuz\runtime\node22\node.exe <TOOLS_ROOT>\scripts\deploy\deploy-cli.mjs retention-report --releases C:\FiyatUcuz\releases --protect <CURRENT_RELEASE_DIR>,<PREVIOUS_RELEASE_DIR>
+   ```
+
+### Production
+
+**Not authorized** until the conditions in [standard §2](production-operations-standard.md#2-production-authorization) are met. When they are, production uses the same commands with these labels, only under a completed [approval record](production-deployment-checklist.md) whose gates are all GO:
+
+| Step                         | Label                                                                        |
+| ---------------------------- | ---------------------------------------------------------------------------- |
+| Preflight                    | `[PRODUCTION] [READ-ONLY]`                                                   |
+| Prepare                      | `[PRODUCTION] [MUTATING]` — release directory and seal only                  |
+| Migration status             | `[PRODUCTION] [READ-ONLY]`                                                   |
+| Activate                     | `[PRODUCTION] [MUTATING]` — Gates 1–3 GO first                               |
+| Post-deployment verification | `[PRODUCTION] [READ-ONLY]`                                                   |
+| Retention report             | `[PRODUCTION] [READ-ONLY]`                                                   |
+| Manual rollback              | `[PRODUCTION] [MUTATING]` — see [incident-recovery.md](incident-recovery.md) |
+
+Every production command passes `-Root C:\FiyatUcuz` explicitly, as in the staging examples. The first switch from the legacy `app\` directory to `current` is not covered by these steps; it is part of 15A-P (gap G8).
 
 ### Prepare details
 
@@ -122,10 +185,15 @@ Statuses are decided in Node (`decideFailureStatus`) and tested. The database is
 
 ## Manual rollback
 
+```powershell
+# [STAGING] [MUTATING] application rollback to the release in current.prev
+& <TOOLS_ROOT>\scripts\deploy\windows\Rollback-FiyatUcuzApi.ps1 -Root C:\FiyatUcuz -ToolsRoot <TOOLS_ROOT> -ToReleaseId <PREVIOUS_RELEASE_ID> -SealSha256 <PREVIOUS_SEAL_SHA256>
+
+# [STAGING] [MUTATING] application rollback to the legacy app\ directory (explicit only)
+& <TOOLS_ROOT>\scripts\deploy\windows\Rollback-FiyatUcuzApi.ps1 -Root C:\FiyatUcuz -ToolsRoot <TOOLS_ROOT> -ToLegacy
 ```
-Rollback-FiyatUcuzApi.ps1 -ToolsRoot <tools> -ToReleaseId <previous-id> [-SealSha256 <hex>]
-Rollback-FiyatUcuzApi.ps1 -ToolsRoot <tools> -ToLegacy      # explicit, legacy app\ only
-```
+
+In production these are `[PRODUCTION] [MUTATING]` and follow [incident-recovery.md](incident-recovery.md). A manual rollback is an **application** rollback only; a database restore is a separate, manual, approved decision ([standard §8](production-operations-standard.md#8-rollback-standard)).
 
 - Before the service is stopped: release id format, seal (and digest if given), `api.env` policy, service identity and a dry run of the junction plan. The target must be `current.prev`.
 - The legacy directory is never treated as a sealed release; it is reachable only with `-ToLegacy`.

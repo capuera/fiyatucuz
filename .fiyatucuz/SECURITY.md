@@ -106,10 +106,13 @@ Deferred (not MVP): nation-state, insider ops, physical security.
 - Postgres: daily full + WAL streaming to object storage; retention TBD.
 - Object storage: versioned buckets.
 - Restore drills quarterly (planned).
+- Deployment backups (verified backup before any migration, evidence, retention): [production operations standard §7 / §10](../docs/operations/production-operations-standard.md#7-backup-standard).
 
 ## 15. Incident response
 
 Not yet defined. Owner and process to be captured before production launch.
+
+Deployment incidents (failed or rolled-back deployments, ambiguous activation state): [incident-recovery.md](../docs/operations/incident-recovery.md).
 
 ## 16. Compliance posture
 
