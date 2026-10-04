@@ -5,6 +5,9 @@
 //   node scripts/release/api-release.mjs prepare --output <dir>
 //   node scripts/release/api-release.mjs verify --release <dir> --stage source|materialized [--manifest-sha256 <hex>]
 //   node scripts/release/api-release.mjs install-plan --release <dir> [--node <path>] [--pnpm <pnpm.cjs>] [--store <dir>]
+//   node scripts/release/api-release.mjs check-archive --names <tar -tf output> --verbose <tar -tvf output>
+//   node scripts/release/api-release.mjs seal --release <dir> --seal <file> --release-id <id> --manifest-sha256 <hex>
+//   node scripts/release/api-release.mjs verify --release <dir> --stage sealed --seal <file> [--seal-sha256 <hex>]
 //
 // Exit codes: 0 ok, 1 verification/preparation failure, 2 usage error.
 
@@ -20,9 +23,13 @@ import {
   installPlan,
   listWorkspacePackages,
   MANIFEST_FILE,
+  parseTarListings,
   prepareRelease,
   ReleaseError,
+  sealRelease,
+  validateArchiveEntries,
   verifyRelease,
+  verifySealedRelease,
 } from './release-lib.mjs';
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
@@ -83,13 +90,28 @@ function main(argv) {
       return 0;
     }
     case 'verify': {
-      const opts = parseOptions(rest, ['--release', '--stage', '--manifest-sha256']);
+      const opts = parseOptions(rest, [
+        '--release',
+        '--stage',
+        '--manifest-sha256',
+        '--seal',
+        '--seal-sha256',
+      ]);
       if (!opts.release || !opts.stage) throw new UsageError('--release and --stage are required');
-      const result = verifyRelease({
-        releaseDir: opts.release,
-        stage: opts.stage,
-        expectedManifestSha256: opts['manifest-sha256'],
-      });
+      if (opts.stage === 'sealed' && !opts.seal)
+        throw new UsageError('--seal is required for --stage sealed');
+      const result =
+        opts.stage === 'sealed'
+          ? verifySealedRelease({
+              releaseDir: opts.release,
+              sealPath: opts.seal,
+              expectedSealSha256: opts['seal-sha256'],
+            })
+          : verifyRelease({
+              releaseDir: opts.release,
+              stage: opts.stage,
+              expectedManifestSha256: opts['manifest-sha256'],
+            });
       if (result.ok) {
         out(`release OK (${opts.stage})`);
         return 0;
@@ -109,9 +131,38 @@ function main(argv) {
       out(JSON.stringify(plan, null, 2));
       return 0;
     }
+    case 'check-archive': {
+      const opts = parseOptions(rest, ['--names', '--verbose']);
+      if (!opts.names || !opts.verbose) throw new UsageError('--names and --verbose are required');
+      const entries = parseTarListings(
+        readFileSync(opts.names, 'utf8'),
+        readFileSync(opts.verbose, 'utf8'),
+      );
+      const result = validateArchiveEntries(entries);
+      if (result.ok) {
+        out(`archive listing OK (${entries.length} entries)`);
+        return 0;
+      }
+      for (const e of result.errors) err(`archive: ${e}`);
+      return 1;
+    }
+    case 'seal': {
+      const opts = parseOptions(rest, ['--release', '--seal', '--release-id', '--manifest-sha256']);
+      for (const k of ['release', 'seal', 'release-id', 'manifest-sha256']) {
+        if (!opts[k]) throw new UsageError(`--${k} is required`);
+      }
+      const { sealSha256 } = sealRelease({
+        releaseDir: opts.release,
+        sealPath: opts.seal,
+        releaseId: opts['release-id'],
+        expectedManifestSha256: opts['manifest-sha256'],
+      });
+      out(`seal sha256: ${sealSha256}`);
+      return 0;
+    }
     default:
       throw new UsageError(
-        'usage: api-release.mjs <closure|prepare|verify|install-plan> [options]',
+        'usage: api-release.mjs <closure|prepare|verify|install-plan|check-archive|seal> [options]',
       );
   }
 }

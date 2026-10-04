@@ -20,9 +20,10 @@ import {
   mkdirSync,
   readdirSync,
   readFileSync,
+  readlinkSync,
   writeFileSync,
 } from 'node:fs';
-import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 
 export const MANIFEST_FILE = 'release-manifest.json';
 export const MANIFEST_SCHEMA_VERSION = 1;
@@ -627,4 +628,257 @@ function safeReaddir(dir) {
   } catch {
     return [];
   }
+}
+
+// ===========================================================================
+// ADIM 15A-4 — archive entry validation (before extraction)
+// ===========================================================================
+
+const TAR_TYPE_BY_CHAR = Object.freeze({
+  '-': 'file',
+  d: 'directory',
+  l: 'symlink',
+  h: 'hardlink',
+});
+
+/**
+ * Pair `tar -tf` (exact names, one per line) with `tar -tvf` (type in the
+ * first column) for the same archive. Names are never parsed out of the
+ * verbose listing (owner/date/link suffixes make that ambiguous). A line-count
+ * mismatch (e.g. a name containing a newline) fails closed.
+ * bsdtar/libarchive format; Windows tar.exe behaviour is verified in 15A-7.
+ */
+export function parseTarListings(namesText, verboseText) {
+  const split = (t) => t.split(/\r?\n/).filter((l) => l.length > 0);
+  const names = split(namesText);
+  const verbose = split(verboseText);
+  if (names.length === 0) throw new ReleaseError('archive listing is empty');
+  if (names.length !== verbose.length) {
+    throw new ReleaseError('archive listings disagree (entry count mismatch)');
+  }
+  return names.map((name, i) => ({
+    path: name,
+    type: TAR_TYPE_BY_CHAR[verbose[i][0]] ?? 'other',
+  }));
+}
+
+const WINDOWS_RESERVED = /^(con|prn|aux|nul|com[0-9]|lpt[0-9])(\..*)?$/i;
+
+/**
+ * Segments Windows would reinterpret: ":" (drive / alternate data stream),
+ * reserved device names, trailing dot/space (silently stripped by Win32),
+ * reserved characters and control characters.
+ */
+function isUnsafeWindowsSegment(seg) {
+  return (
+    /[:*?"<>|]/.test(seg) ||
+    // eslint-disable-next-line no-control-regex
+    /[\u0000-\u001f]/.test(seg) ||
+    /[. ]$/.test(seg) ||
+    WINDOWS_RESERVED.test(seg)
+  );
+}
+
+/**
+ * Validate archive entries BEFORE anything is extracted. Only regular files
+ * and directories with safe relative names are allowed: no absolute, drive,
+ * UNC or backslash paths, no `..`, no Windows-reinterpreted names (ADS ":",
+ * device names, trailing dot/space), no case-insensitive duplicates, no
+ * file/directory conflicts, no symlinks / hard links / devices / FIFOs.
+ * A leading "./" (tar -C dir .) is accepted and stripped.
+ */
+export function validateArchiveEntries(entries) {
+  const errors = [];
+  const seen = new Map(); // lower-cased path -> type (NTFS is case-insensitive)
+  for (const entry of entries) {
+    const raw = String(entry?.path ?? '');
+    const shown = raw.slice(0, 120);
+    if (entry?.type !== 'file' && entry?.type !== 'directory') {
+      errors.push(`unsupported archive entry type (${entry?.type}): ${shown}`);
+      continue;
+    }
+    if (raw === './' || raw === '.') continue;
+    if (/^[\\/]/.test(raw) || /^[A-Za-z]:/.test(raw) || raw.includes('\\') || raw.includes('\0')) {
+      errors.push(`unsafe archive path: ${shown}`);
+      continue;
+    }
+    let rel = raw.startsWith('./') ? raw.slice(2) : raw;
+    if (entry.type === 'directory') rel = rel.replace(/\/$/, '');
+    if (!isSafeRelativePath(rel) || rel.split('/').some(isUnsafeWindowsSegment)) {
+      errors.push(`unsafe archive path: ${shown}`);
+      continue;
+    }
+    if (isForbiddenPath(rel)) errors.push(`forbidden file in archive: ${rel}`);
+    const key = rel.toLowerCase();
+    if (seen.has(key)) errors.push(`duplicate archive entry: ${rel}`);
+    seen.set(key, entry.type);
+  }
+  for (const key of seen.keys()) {
+    const parts = key.split('/');
+    for (let i = 1; i < parts.length; i += 1) {
+      if (seen.get(parts.slice(0, i).join('/')) === 'file') {
+        errors.push(`archive entry is below a file: ${key}`);
+        break;
+      }
+    }
+  }
+  if (seen.get(MANIFEST_FILE) !== 'file') {
+    errors.push(`archive does not contain ${MANIFEST_FILE} at its root`);
+  }
+  return { ok: errors.length === 0, errors };
+}
+
+// ===========================================================================
+// ADIM 15A-4 — seal (materialized + built + verified release)
+// ===========================================================================
+
+export const SEAL_SCHEMA_VERSION = 1;
+export const SEAL_KIND = 'fiyatucuz-api-release-seal';
+
+/** Strip the Win32 namespace prefixes readlink may return for junctions. */
+function linkTargetPath(target) {
+  return String(target).replace(/^(\\\\\?\\|\\\?\?\\)/, '');
+}
+
+/**
+ * Every entry under `dir` as [rel, kind, value] tuples, sorted by path:
+ * files ("file", sha256), directories ("dir", ""), links ("link", target),
+ * anything else ("other", ""). Links are recorded, never followed; a link
+ * whose target resolves outside `root` is reported in `escapes` (Node would
+ * follow it at runtime).
+ */
+function treeEntries(root, dir, rel, escapes) {
+  const out = [];
+  const walk = (abs, r) => {
+    for (const e of safeReaddir(abs)) {
+      const childAbs = join(abs, e);
+      const childRel = `${r}/${e}`;
+      const st = lstatSync(childAbs);
+      if (st.isSymbolicLink()) {
+        // pnpm links (Windows: junctions with absolute targets — the reason a
+        // materialized release must never be moved). Target is part of the seal.
+        const target = readlinkSync(childAbs);
+        if (!isInside(root, resolve(dirname(childAbs), linkTargetPath(target))))
+          escapes.push(childRel);
+        out.push([childRel, 'link', target]);
+      } else if (st.isDirectory()) {
+        out.push([childRel, 'dir', '']);
+        walk(childAbs, childRel);
+      } else if (st.isFile()) {
+        out.push([childRel, 'file', sha256File(childAbs)]);
+      } else {
+        out.push([childRel, 'other', '']);
+      }
+    }
+  };
+  walk(dir, rel);
+  return out.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+}
+
+function sealContent(releaseDir, manifest) {
+  const root = resolve(releaseDir);
+  const escapes = [];
+  const closureDirs = manifest.workspaceClosure.map((w) => w.dir);
+  const build = closureDirs.flatMap((d) =>
+    treeEntries(root, join(root, ...d.split('/'), 'dist'), `${d}/dist`, escapes),
+  );
+  const nmDirs = ['node_modules', ...closureDirs.map((d) => `${d}/node_modules`)];
+  const nm = nmDirs.flatMap((d) => treeEntries(root, join(root, ...d.split('/')), d, escapes));
+  // One JSON tuple per line: no separator ambiguity between path, kind and value.
+  const digest = (list) => sha256Text(list.map((t) => JSON.stringify(t)).join('\n'));
+  return {
+    escapes,
+    content: {
+      buildOutputs: build
+        .filter((t) => t[1] === 'file')
+        .map(([path, , sha256]) => ({ path, sha256 })),
+      buildTreeSha256: digest(build),
+      nodeModules: { entries: nm.length, treeSha256: digest(nm) },
+    },
+  };
+}
+
+/**
+ * Seal a release that has been materialized, built and verified. The seal is
+ * written OUTSIDE the release directory (never inside — the release must stay
+ * byte-identical) and must not exist yet. Returns { seal, sealSha256 }.
+ */
+export function sealRelease({ releaseDir, sealPath, releaseId, expectedManifestSha256 }) {
+  const root = resolve(releaseDir);
+  if (isInside(root, sealPath))
+    throw new ReleaseError('seal must be written outside the release directory');
+  if (!expectedManifestSha256)
+    throw new ReleaseError('expected manifest SHA-256 is required to seal');
+  const result = verifyRelease({ releaseDir: root, stage: 'materialized', expectedManifestSha256 });
+  if (!result.ok) {
+    throw new ReleaseError(
+      `release is not verifiable; refusing to seal (${result.errors.length} error(s))`,
+    );
+  }
+  const manifest = JSON.parse(readFileSync(join(root, MANIFEST_FILE), 'utf8'));
+  if (releaseId !== basename(root)) {
+    throw new ReleaseError('release id must equal the release directory name');
+  }
+  const { escapes, content } = sealContent(root, manifest);
+  if (escapes.length > 0) {
+    throw new ReleaseError(
+      `link target outside the release; refusing to seal (e.g. ${escapes[0]})`,
+    );
+  }
+  const seal = {
+    schemaVersion: SEAL_SCHEMA_VERSION,
+    kind: SEAL_KIND,
+    releaseId,
+    gitCommit: manifest.gitCommit,
+    manifestSha256: expectedManifestSha256,
+    ...content,
+  };
+  const text = `${JSON.stringify(seal, null, 2)}\n`;
+  writeFileSync(sealPath, text, { flag: 'wx' });
+  return { seal, sealSha256: sha256Text(text) };
+}
+
+/**
+ * Re-verify a sealed release immediately before activation / rollback:
+ * materialized verification + the seal's build-output hashes and node_modules
+ * tree hash (catches any change since sealing). Returns { ok, errors }.
+ */
+export function verifySealedRelease({ releaseDir, sealPath, expectedSealSha256 }) {
+  const root = resolve(releaseDir);
+  let text;
+  let seal;
+  try {
+    text = readFileSync(sealPath, 'utf8');
+    seal = JSON.parse(text);
+  } catch {
+    return { ok: false, errors: ['seal missing or not valid JSON'] };
+  }
+  const errors = [];
+  if (expectedSealSha256 && sha256Text(text) !== expectedSealSha256)
+    errors.push('seal SHA-256 mismatch');
+  if (seal.schemaVersion !== SEAL_SCHEMA_VERSION || seal.kind !== SEAL_KIND)
+    errors.push('unsupported seal');
+  if (seal.releaseId !== basename(root)) errors.push('seal belongs to a different release');
+  const base = verifyRelease({
+    releaseDir: root,
+    stage: 'materialized',
+    expectedManifestSha256: seal.manifestSha256,
+  });
+  errors.push(...base.errors);
+  if (base.ok) {
+    const manifest = JSON.parse(readFileSync(join(root, MANIFEST_FILE), 'utf8'));
+    if (manifest.gitCommit !== seal.gitCommit) errors.push('seal commit does not match manifest');
+    const { escapes, content: now } = sealContent(root, manifest);
+    if (escapes.length > 0) errors.push(`link target outside the release: ${escapes[0]}`);
+    if (
+      JSON.stringify(now.buildOutputs) !== JSON.stringify(seal.buildOutputs) ||
+      now.buildTreeSha256 !== seal.buildTreeSha256
+    ) {
+      errors.push('build outputs changed since sealing');
+    }
+    if (now.nodeModules.treeSha256 !== seal.nodeModules?.treeSha256) {
+      errors.push('node_modules changed since sealing');
+    }
+  }
+  return { ok: errors.length === 0, errors };
 }

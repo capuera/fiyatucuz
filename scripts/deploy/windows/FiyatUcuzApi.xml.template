@@ -1,0 +1,41 @@
+<!--
+  WinSW configuration TEMPLATE for the FiyatUcuz API (ADIM 15A-4, ADR-0021).
+
+  TEMPLATE ONLY: not applied by any 15A-4 tooling. Applying it to the host
+  (and re-registering the service) is part of the production cutover (15A-P),
+  after Windows verification (15A-7).
+
+  NOT VERIFIED: exact WinSW version/element syntax on the host, in particular
+  the <serviceaccount> form for NT AUTHORITY\LocalService (WinSW 3 uses
+  <username>; WinSW 2 uses <domain>/<user>) and <stoptimeout>.
+  Review in 15A-P:
+  - <onfailure action="none"/> means no automatic restart after a crash
+    (deliberate during deployment; decide the steady-state policy).
+  - The working directory and entry point resolve through the "current"
+    junction when the service STARTS; a running process keeps the release it
+    started from, which is why the swap happens only while stopped.
+  - stdout/stderr go to C:\FiyatUcuz\logs\api (LocalService: Modify).
+
+  - Runs the release behind the C:\FiyatUcuz\current junction.
+  - Only config\api.env is loaded (never migration.env).
+  - The service identity is fixed: id FiyatUcuzApi, NT AUTHORITY\LocalService.
+-->
+<service>
+  <id>FiyatUcuzApi</id>
+  <name>FiyatUcuzApi</name>
+  <description>FiyatUcuz API (Node 22, 127.0.0.1:4000 behind IIS/ARR)</description>
+  <executable>C:\FiyatUcuz\runtime\node22\node.exe</executable>
+  <arguments>--env-file=C:\FiyatUcuz\config\api.env C:\FiyatUcuz\current\services\api\dist\index.js</arguments>
+  <workingdirectory>C:\FiyatUcuz\current\services\api</workingdirectory>
+  <serviceaccount>
+    <username>NT AUTHORITY\LocalService</username>
+  </serviceaccount>
+  <startmode>Automatic</startmode>
+  <stoptimeout>60 sec</stoptimeout>
+  <onfailure action="none" />
+  <logpath>C:\FiyatUcuz\logs\api</logpath>
+  <log mode="roll-by-size">
+    <sizeThreshold>10240</sizeThreshold>
+    <keepFiles>10</keepFiles>
+  </log>
+</service>
