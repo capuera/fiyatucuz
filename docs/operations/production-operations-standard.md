@@ -73,24 +73,24 @@ The record is stored with the deployment receipts (`C:\FiyatUcuz\deployments\`) 
 
 Production deployments are based only on exact, immutable identifiers — never on "latest main" or "latest build".
 
-| Evidence                 | Requirement                                                                                                                                             |
-| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Git commit               | Full 40-character SHA                                                                                                                                   |
-| Provenance               | Approver confirms the commit exists on `origin/main` (gap G13: not checked by tooling)                                                                  |
-| Clean prepare            | `api-release.mjs prepare` ran on a clean tree at that commit                                                                                            |
-| Manifest SHA-256         | Printed by `prepare`, recorded out of band                                                                                                              |
-| Archive SHA-256          | Of the exact `.tgz` transferred                                                                                                                         |
-| Seal SHA-256             | Printed by the Windows Prepare phase                                                                                                                    |
-| Release ID               | `yyyymmdd-<first 12 hex of the commit>`                                                                                                                 |
-| Tests / build            | Results recorded by the preparer for that commit (gap G5: current CI is not sufficient evidence)                                                        |
-| Migration status         | Pending list from the read-only status; **no "recorded but missing from this checkout" entries** (normal Activate refuses them: `RECORDED_BUT_MISSING`) |
-| Migration classification | Class per file (§3) and the review (§6)                                                                                                                 |
-| Known issues             | Listed with a disposition; no unresolved critical issue                                                                                                 |
-| Backup readiness         | pg_dump / pg_restore paths and versions; pg_dump major version ≥ server version; free disk                                                              |
-| 15A-7 evidence           | Reference to the accepted validation record (§12)                                                                                                       |
-| Staging rehearsal        | Per-release rehearsal on Windows staging: required for B–D, recommended for A                                                                           |
-| Rollback target          | Release ID of the current release (the tooling verifies its seal)                                                                                       |
-| People and time          | Operator, PREPARED BY, REVIEWED/APPROVED BY, planned window                                                                                             |
+| Evidence                 | Requirement                                                                                                                                                            |
+| ------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Git commit               | Full 40-character SHA                                                                                                                                                  |
+| Provenance               | Approver confirms the commit exists on `origin/main` (gap G13: not checked by tooling)                                                                                 |
+| Clean prepare            | `api-release.mjs prepare` ran on a clean tree at that commit                                                                                                           |
+| Manifest SHA-256         | Printed by `prepare`, recorded out of band                                                                                                                             |
+| Archive SHA-256          | Of the exact `.tgz` transferred                                                                                                                                        |
+| Seal SHA-256             | Printed by the Windows Prepare phase                                                                                                                                   |
+| Release ID               | `yyyymmdd-<first 12 hex of the commit>`                                                                                                                                |
+| Tests / build            | Green CI run for the exact commit (link to the run): format gate, lint, typecheck, build, tooling tests, migrations and integration tests ([CI](../development/ci.md)) |
+| Migration status         | Pending list from the read-only status; **no "recorded but missing from this checkout" entries** (normal Activate refuses them: `RECORDED_BUT_MISSING`)                |
+| Migration classification | Class per file (§3) and the review (§6)                                                                                                                                |
+| Known issues             | Listed with a disposition; no unresolved critical issue                                                                                                                |
+| Backup readiness         | pg_dump / pg_restore paths and versions; pg_dump major version ≥ server version; free disk                                                                             |
+| 15A-7 evidence           | Reference to the accepted validation record (§12)                                                                                                                      |
+| Staging rehearsal        | Per-release rehearsal on Windows staging: required for B–D, recommended for A                                                                                          |
+| Rollback target          | Release ID of the current release (the tooling verifies its seal)                                                                                                      |
+| People and time          | Operator, PREPARED BY, REVIEWED/APPROVED BY, planned window                                                                                                            |
 
 ## 6. Migration review standard
 
@@ -259,13 +259,13 @@ Code-resolved in ADIM 15A-6A — still to be proven on Windows staging (15A-7):
 
 Recorded, handled by policy for now:
 
-| Gap | Handling                                                                                                                            |
-| --- | ----------------------------------------------------------------------------------------------------------------------------------- |
-| G4  | `/health` is liveness, not database readiness → manual database-reading smoke test (§13).                                           |
-| G5  | Current CI (format, lint, typecheck, build; no tests) is not sufficient release evidence → preparer records test/build results.     |
-| G6  | WinSW v2.12.0 XML must be verified/corrected in 15A-7 (the template uses a newer `serviceaccount` form).                            |
-| G7  | No environment marker → labelled runbooks, explicit `-Root`, separate staging machine.                                              |
-| G8  | The first legacy `app\` → `current` cutover is a 15A-P procedure; Activate requires `current` to already point to a sealed release. |
-| G11 | Migration review must consider `lock_timeout` (§6).                                                                                 |
-| G12 | Administrative migration credential is a known accepted risk for now.                                                               |
-| G13 | Approver manually confirms the exact commit exists on `origin/main`.                                                                |
+| Gap | Handling                                                                                                                                                                                                                                                                                                          |
+| --- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| G4  | `/health` is liveness, not database readiness → manual database-reading smoke test (§13).                                                                                                                                                                                                                         |
+| G5  | Resolved in the repository by 15A-6B: CI runs all test suites, including integration tests on a throwaway PostgreSQL, and a baseline-aware format gate ([CI](../development/ci.md)). The first green run on GitHub must be confirmed before it is used as evidence. CI does not verify Windows behaviour (15A-7). |
+| G6  | WinSW v2.12.0 XML must be verified/corrected in 15A-7 (the template uses a newer `serviceaccount` form).                                                                                                                                                                                                          |
+| G7  | No environment marker → labelled runbooks, explicit `-Root`, separate staging machine.                                                                                                                                                                                                                            |
+| G8  | The first legacy `app\` → `current` cutover is a 15A-P procedure; Activate requires `current` to already point to a sealed release.                                                                                                                                                                               |
+| G11 | Migration review must consider `lock_timeout` (§6).                                                                                                                                                                                                                                                               |
+| G12 | Administrative migration credential is a known accepted risk for now.                                                                                                                                                                                                                                             |
+| G13 | Approver manually confirms the exact commit exists on `origin/main`.                                                                                                                                                                                                                                              |

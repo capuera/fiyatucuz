@@ -373,7 +373,11 @@ export function parseMigrationStatus(stdout) {
     const line = raw.replace(/\s+$/, '');
     const at = `line ${i + 1}`;
     if (line === '') return;
-    const t = /^\[db:migrate\] target: database=(\S+) user=.* server=(\S.*)$/.exec(line);
+    // Database: a plain identifier only (never URL- or credential-like).
+    const t =
+      /^\[db:migrate\] target: database=([A-Za-z0-9_][A-Za-z0-9_.$-]*) user=.* server=(\S.*)$/.exec(
+        line,
+      );
     if (t) {
       if (stage !== 0) fail(`${at}: unexpected target line`);
       target = { database: t[1], serverVersion: t[2] };
@@ -419,6 +423,9 @@ export function parseMigrationStatus(stdout) {
   return { ...lists, target };
 }
 
+// "[db:migrate] Applied <id>.sql" lines of the apply mode; same ID form as the status parser.
+const APPLIED_LINE = /^\[db:migrate\] Applied ([A-Za-z0-9][A-Za-z0-9._-]*\.sql)[ \t]*\r?$/gm;
+
 function classifyMigrationFailure(code, stderr) {
   if (code === 2) return 'USAGE';
   if (/MigrationLockUnavailableError/.test(stderr)) return 'LOCK_BUSY';
@@ -450,11 +457,15 @@ export function runMigrationCli({
     ...(mode === 'status' ? ['--status'] : []),
   ];
   const r = run(node, args, { env: sanitizedChildEnv(parentEnv), timeoutMs });
-  const stdout = redact(r.stdout, secrets);
-  const stderr = redact(r.stderr, secrets);
+  // Raw child output never leaves this function. Machine data (migration IDs,
+  // database name, failure class) is parsed from the RAW output, so redaction
+  // cannot corrupt it (ADIM 15A-6C); only free text that can reach the
+  // operator (the stderr message, the server version) is redacted.
   // Migrations the CLI reported as committed — also on failure (a later
   // migration may fail after earlier ones were applied).
-  const appliedNow = [...stdout.matchAll(/\] Applied (\S+\.sql)/g)].map((m) => m[1]);
+  const appliedNow = [...r.stdout.matchAll(APPLIED_LINE)].map((m) => m[1]);
+  const errorMessage = () =>
+    redact(r.stderr.split(/\r?\n/).find((l) => l.trim()) ?? 'migration CLI failed', secrets);
   if (r.spawnError)
     return {
       ok: false,
@@ -468,12 +479,12 @@ export function runMigrationCli({
   if (r.code !== 0) {
     return {
       ok: false,
-      outcome: classifyMigrationFailure(r.code, stderr),
+      outcome: classifyMigrationFailure(r.code, r.stderr),
       exitCode: r.code,
       applied: mode === 'apply' ? appliedNow : [],
       pending: [],
       recordedMissing: [],
-      message: stderr.split(/\r?\n/).find((l) => l.trim()) ?? 'migration CLI failed',
+      message: errorMessage(),
     };
   }
   if (mode === 'apply') {
@@ -489,7 +500,8 @@ export function runMigrationCli({
   }
   let status;
   try {
-    status = parseMigrationStatus(stdout);
+    status = parseMigrationStatus(r.stdout);
+    status.target.serverVersion = redact(status.target.serverVersion, secrets);
   } catch (e) {
     if (!(e instanceof DeployError)) throw e;
     return {
@@ -634,15 +646,19 @@ export function probePgDumpVersion(pgDump, { parentEnv = process.env, secrets = 
       `pg_dump --version failed (exit ${r.code}); backup not attempted`,
     );
   }
-  const first = redact(r.stdout.split(/\r?\n/)[0] ?? '', secrets).trim();
-  const m = /^pg_dump \(PostgreSQL\) (\d+)(?:\.\d+)*(?:\s.*)?$/.exec(first);
+  // Parse and validate the RAW first line (ADIM 15A-6C.1): redaction must not
+  // alter machine data. The raw line never leaves this function; only its
+  // redacted form is stored (redacted first, then bounded, so a secret can
+  // never be cut in half).
+  const raw = (r.stdout.split(/\r?\n/)[0] ?? '').trim();
+  const m = /^pg_dump \(PostgreSQL\) (\d+)(?:\.\d+)*(?:\s.*)?$/.exec(raw);
   if (!m) {
     throw new DeployError(
       'BACKUP_FAILED',
       'pg_dump --version output not recognized; backup not attempted',
     );
   }
-  return { pgDumpVersion: first.slice(0, 200), pgDumpMajor: Number(m[1]) };
+  return { pgDumpVersion: redact(raw, secrets).slice(0, 200), pgDumpMajor: Number(m[1]) };
 }
 
 /**

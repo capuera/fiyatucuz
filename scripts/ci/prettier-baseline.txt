@@ -1,0 +1,84 @@
+# Prettier baseline: files that were not Prettier-formatted when the format
+# gate was introduced (ADIM 15A-6B, commit 395cefc). Historical debt only.
+#
+# Rules (scripts/ci/check-format.mjs, docs/development/ci.md):
+# - This list may only SHRINK. Never add a file to make CI pass.
+# - A file listed here that you change must be formatted in the same change,
+#   and its line removed.
+# - Formatting is done per file (pnpm exec prettier --write <file>), never
+#   repository-wide.
+
+adr/0004-multi-tenancy-model.md
+adr/0012-database-foundation.md
+adr/0013-identity-tenants.md
+adr/0014-auth-endpoints.md
+adr/0015-merchants-sites.md
+adr/0016-feed-ingestion-foundation.md
+adr/0017-feed-archive-storage.md
+adr/0018-merchant-offers-feed-import.md
+packages/db/README.md
+packages/db/drizzle/README.md
+packages/db/src/schema/feeds.ts
+packages/db/src/schema/merchants.ts
+packages/db/src/schema/offers.ts
+packages/db/src/schema/tenants.ts
+packages/db/test/auth-bootstrap.test.ts
+packages/db/test/feeds.test.ts
+packages/db/test/grants.test.ts
+packages/db/test/merchants.test.ts
+packages/db/test/offers.test.ts
+packages/db/test/reporting.test.ts
+packages/db/test/schema.test.ts
+packages/db/test/tenant.test.ts
+packages/db/test/transaction.test.ts
+services/api/src/config/env.ts
+services/api/src/modules/auth/env.ts
+services/api/src/modules/auth/middleware.ts
+services/api/src/modules/auth/oauth/apple.ts
+services/api/src/modules/auth/oauth/google.ts
+services/api/src/modules/auth/oauth/index.ts
+services/api/src/modules/auth/repository.ts
+services/api/src/modules/auth/routes.ts
+services/api/src/modules/auth/service.ts
+services/api/src/modules/feeds/archive/factory.ts
+services/api/src/modules/feeds/archive/local.ts
+services/api/src/modules/feeds/archive/reference.ts
+services/api/src/modules/feeds/env.ts
+services/api/src/modules/feeds/fetcher.ts
+services/api/src/modules/feeds/import/importer.ts
+services/api/src/modules/feeds/import/mapping.ts
+services/api/src/modules/feeds/import/normalize/money.ts
+services/api/src/modules/feeds/import/normalize/offer.ts
+services/api/src/modules/feeds/import/verified-archive.ts
+services/api/src/modules/feeds/import/xml-items.ts
+services/api/src/modules/feeds/index.ts
+services/api/src/modules/feeds/parser/index.ts
+services/api/src/modules/feeds/parser/xml-encoding.ts
+services/api/src/modules/feeds/parser/xml-security.ts
+services/api/src/modules/feeds/repository.ts
+services/api/src/modules/feeds/routes.ts
+services/api/src/modules/feeds/service.ts
+services/api/src/modules/feeds/ssrf.ts
+services/api/src/modules/identity/repository.ts
+services/api/src/modules/merchants/routes.ts
+services/api/src/modules/merchants/service.ts
+services/api/src/modules/merchants/validation.ts
+services/api/src/modules/tenants/repository.ts
+services/api/src/modules/tenants/service.ts
+services/api/test/auth-routes.test.ts
+services/api/test/auth-service.test.ts
+services/api/test/feeds-archive-windows.test.ts
+services/api/test/feeds-archive.test.ts
+services/api/test/feeds-encoding.test.ts
+services/api/test/feeds-import.test.ts
+services/api/test/feeds-normalize.test.ts
+services/api/test/feeds-parser.test.ts
+services/api/test/feeds-routes.test.ts
+services/api/test/feeds-service.test.ts
+services/api/test/feeds-ssrf.test.ts
+services/api/test/feeds-xml-items.test.ts
+services/api/test/identity.test.ts
+services/api/test/merchants-routes.test.ts
+services/api/test/merchants.test.ts
+services/api/test/production-runtime.test.ts
+services/api/test/security-rate-limit.test.ts

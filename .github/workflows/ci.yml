@@ -1,5 +1,10 @@
 name: CI
 
+# Required checks and local equivalents: docs/development/ci.md.
+# No production secrets, databases or services are used: the only database is
+# the throwaway PostgreSQL service container below (same image as
+# infra/dev/docker-compose.yml) with a dummy CI-only password.
+
 on:
   pull_request:
     branches: [master, main]
@@ -10,13 +15,37 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   ci:
-    name: lint + typecheck + build
+    name: format + lint + typecheck + build + test
     runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: fiyatucuz
+          # Dummy, CI-only value; not a secret.
+          POSTGRES_PASSWORD: ci-only-not-a-secret
+          # The integration-test guard only accepts this database name.
+          POSTGRES_DB: fiyatucuz_adim14
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U fiyatucuz -d fiyatucuz_adim14"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # Full history: the format gate compares against the base commit.
+          fetch-depth: 0
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
@@ -32,8 +61,18 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Format check
-        run: pnpm run format
+      - name: Format gate (baseline + changed files)
+        env:
+          BASE_REF: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          # New branch (all-zero SHA) or a base missing after a force push:
+          # fall back to the baseline-only check (still checks every file).
+          if [ -n "$BASE_REF" ] && git cat-file -e "${BASE_REF}^{commit}" 2>/dev/null; then
+            node scripts/ci/check-format.mjs --changed-since "$BASE_REF"
+          else
+            echo "No usable base commit; running the baseline-only format gate."
+            node scripts/ci/check-format.mjs
+          fi
 
       - name: Lint
         run: pnpm run lint
@@ -43,3 +82,27 @@ jobs:
 
       - name: Build
         run: pnpm run build
+
+      - name: Tooling tests (release, deploy, CI gate)
+        run: pnpm run test:tooling
+
+      - name: Apply migrations to the CI database (real migration CLI)
+        env:
+          DATABASE_MIGRATION_URL: postgres://fiyatucuz:ci-only-not-a-secret@127.0.0.1:5432/fiyatucuz_adim14
+          DATABASE_MIGRATION_EXPECTED_DB: fiyatucuz_adim14
+        run: node packages/db/dist/cli/migrate.js
+
+      - name: Contract - deploy status parser vs real migration CLI
+        # deploy-cli parses migrate.js --status strictly (ADIM 15A-6A). Any
+        # drift in the CLI's output format fails here instead of in a deploy.
+        run: |
+          ENV_FILE="$RUNNER_TEMP/ci-migration.env"
+          printf 'DATABASE_MIGRATION_URL=%s\nDATABASE_MIGRATION_EXPECTED_DB=%s\n' \
+            'postgres://fiyatucuz:ci-only-not-a-secret@127.0.0.1:5432/fiyatucuz_adim14' 'fiyatucuz_adim14' > "$ENV_FILE"
+          node scripts/deploy/deploy-cli.mjs migration --mode status \
+            --node "$(command -v node)" --cli packages/db/dist/cli/migrate.js --env-file "$ENV_FILE"
+
+      - name: Workspace tests (db + api, incl. integration)
+        env:
+          DATABASE_URL: postgres://fiyatucuz:ci-only-not-a-secret@127.0.0.1:5432/fiyatucuz_adim14
+        run: pnpm -r run test

@@ -9,11 +9,13 @@
   },
   "scripts": {
     "lint": "eslint .",
-    "format": "prettier --check .",
+    "format": "node scripts/ci/check-format.mjs",
+    "format:all": "prettier --check .",
     "format:write": "prettier --write .",
     "typecheck": "pnpm -r --parallel run typecheck",
     "build": "pnpm -r run build",
-    "test": "pnpm -r run test"
+    "test": "pnpm -r run test && pnpm run test:tooling",
+    "test:tooling": "node --test scripts/release/test/release.test.mjs scripts/deploy/test/deploy.test.mjs scripts/ci/test/check-format.test.mjs"
   },
   "devDependencies": {
     "@eslint/js": "^9.17.0",

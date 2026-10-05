@@ -2302,6 +2302,476 @@ fs.writeFileSync(process.env.FAKE_STATE, JSON.stringify(state));`,
 // ADIM 15A-6A — G3 backup evidence
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// ADIM 15A-6C — redaction must not corrupt machine-parsed migration evidence
+// ---------------------------------------------------------------------------
+
+describe('15A-6C migration status redaction correctness', () => {
+  /**
+   * Fake migrate.js: prints the files named by FAKE_OUT / FAKE_ERR verbatim and
+   * exits with FAKE_CODE. Secrets come from secretsOf() of the same env file,
+   * exactly as deploy-cli derives them.
+   */
+  function fixture({ password, stdout = '', stderr = '', code = 0 }) {
+    const dir = freshDir('g6c');
+    const outFile = join(dir, 'out.txt');
+    const errFile = join(dir, 'err.txt');
+    writeFileSync(outFile, stdout);
+    writeFileSync(errFile, stderr);
+    const url = `postgres://fiyatucuz_migrator:${password}@127.0.0.1:5432/fiyatucuz_adim14`;
+    const envFile = join(dir, 'migration.env');
+    writeFileSync(
+      envFile,
+      [
+        `DATABASE_MIGRATION_URL=${url}`,
+        'DATABASE_MIGRATION_EXPECTED_DB=fiyatucuz_adim14',
+        `FAKE_OUT=${outFile}`,
+        `FAKE_ERR=${errFile}`,
+        `FAKE_CODE=${code}`,
+      ].join('\n'),
+    );
+    const cli = join(dir, 'migrate.js');
+    writeFileSync(
+      cli,
+      `const fs = require('fs');
+process.stdout.write(fs.readFileSync(process.env.FAKE_OUT, 'utf8'));
+process.stderr.write(fs.readFileSync(process.env.FAKE_ERR, 'utf8'));
+process.exit(Number(process.env.FAKE_CODE));`,
+    );
+    const secrets = secretsOf(parseEnvText(readFileSync(envFile, 'utf8')));
+    const run = (mode) =>
+      runMigrationCli({
+        node: NODE,
+        migrateCli: cli,
+        migrationEnvFile: envFile,
+        mode,
+        parentEnv: { PATH: process.env.PATH },
+        secrets,
+      });
+    return { url, envFile, cli, secrets, run };
+  }
+  const T = '[db:migrate] target: database=fiyatucuz_adim14 user=fiyatucuz_migrator server=16.15';
+  const lines = (...l) => `${l.join('\n')}\n`;
+
+  it('A: a password that is a substring of the database name does not corrupt target.database', () => {
+    const f = fixture({
+      password: 'fiyatucuz',
+      stdout: lines(
+        T,
+        '[db:migrate] applied (1):',
+        '  0001_foundation.sql',
+        '[db:migrate] pending (0):',
+      ),
+    });
+    assert.ok(f.secrets.includes('fiyatucuz'), 'precondition: the password is a secret');
+    const r = f.run('status');
+    assert.equal(r.ok, true, r.message ?? '');
+    assert.equal(r.target.database, 'fiyatucuz_adim14');
+    assert.deepEqual(r.applied, ['0001_foundation.sql']);
+    assert.ok(!JSON.stringify(r).includes(f.url), 'connection URL never in the result');
+  });
+
+  it('B: a password that is a substring of a migration ID does not break the strict parser', () => {
+    const f = fixture({
+      password: 'foundation',
+      stdout: lines(
+        T,
+        '[db:migrate] applied (1):',
+        '  0001_foundation.sql',
+        '[db:migrate] pending (1):',
+        '  0002_identity_tenants.sql',
+      ),
+    });
+    const r = f.run('status');
+    assert.equal(r.ok, true, r.message ?? '');
+    assert.deepEqual(
+      [r.applied, r.pending, r.recordedMissing],
+      [['0001_foundation.sql'], ['0002_identity_tenants.sql'], []],
+    );
+  });
+
+  it('B2: recorded-but-missing IDs overlapping a secret stay exact (fail-closed gate unchanged)', () => {
+    const f = fixture({
+      password: 'foundation',
+      stdout: lines(
+        T,
+        '[db:migrate] applied (0):',
+        '[db:migrate] pending (0):',
+        '[db:migrate] recorded but missing from this checkout (1):',
+        '  0009_foundation_v2.sql',
+      ),
+    });
+    const r = f.run('status');
+    assert.deepEqual([r.ok, r.recordedMissing], [true, ['0009_foundation_v2.sql']]);
+  });
+
+  it('C: failure path: a secret in child stderr never reaches the returned message', () => {
+    const password = 'S3cret-6C-only';
+    const f = fixture({
+      password,
+      code: 1,
+      stderr: `[db:migrate] failed: connection to postgres://fiyatucuz_migrator:${password}@db/x refused (pw ${password})\n`,
+    });
+    for (const mode of ['status', 'apply']) {
+      const r = f.run(mode);
+      assert.equal(r.ok, false);
+      assert.equal(r.outcome, 'FAILED');
+      const text = JSON.stringify(r);
+      assert.ok(
+        !text.includes(password),
+        `${mode}: password leaked: ${text.replace(password, '<pw>')}`,
+      );
+      assert.ok(!text.includes(f.url));
+      assert.match(r.message, /\[REDACTED\]|\*\*\*/);
+    }
+  });
+
+  it('C2: failure classification still sees the raw stderr (lock busy, target mismatch)', () => {
+    const lock = fixture({
+      password: 'Lock',
+      code: 1,
+      stderr: 'MigrationLockUnavailableError: another migration process is already running\n',
+    });
+    assert.equal(lock.run('apply').outcome, 'LOCK_BUSY');
+    const mm = fixture({
+      password: 'Target',
+      code: 1,
+      stderr: 'MigrationTargetMismatchError: Expected database: a\n',
+    });
+    assert.equal(mm.run('status').outcome, 'TARGET_MISMATCH');
+  });
+
+  it('D: apply evidence keeps exact IDs that overlap a secret (success and partial failure)', () => {
+    const ok = fixture({
+      password: 'foundation',
+      stdout: lines(
+        '[db:migrate] Applied 0001_foundation.sql',
+        '[db:migrate] Applied 0002_identity_tenants.sql',
+        '[db:migrate] Done: 2 applied, 0 skipped.',
+      ),
+    });
+    assert.deepEqual(ok.run('apply').applied, ['0001_foundation.sql', '0002_identity_tenants.sql']);
+    const partial = fixture({
+      password: 'foundation',
+      code: 1,
+      stdout: lines('[db:migrate] Applied 0001_foundation.sql'),
+      stderr: 'PostgresError: syntax error\n',
+    });
+    const r = partial.run('apply');
+    assert.deepEqual([r.ok, r.applied], [false, ['0001_foundation.sql']]);
+  });
+
+  it('apply evidence only accepts well-formed IDs on real "Applied" lines', () => {
+    const f = fixture({
+      password: 'pw-not-in-output',
+      stdout: lines(
+        '[db:migrate] Applied 0001_foundation.sql',
+        'noise [db:migrate] Applied 0099_injected.sql',
+        '[db:migrate] Applied ../escape.sql',
+        '[db:migrate] Applied 0002_b.sql trailing',
+      ),
+    });
+    assert.deepEqual(f.run('apply').applied, ['0001_foundation.sql']);
+  });
+
+  it('target.database must be a plain name; URL-like or credential-like tokens fail closed', () => {
+    for (const db of ['postgres://u:p@h/db', 'user@db', 'a:b']) {
+      const f = fixture({
+        password: 'pw-x-unused',
+        stdout: lines(
+          `[db:migrate] target: database=${db} user=u server=16`,
+          '[db:migrate] applied (0):',
+          '[db:migrate] pending (0):',
+        ),
+      });
+      const r = f.run('status');
+      assert.deepEqual([r.ok, r.outcome], [false, 'STATUS_UNPARSEABLE'], db);
+      assert.ok(!JSON.stringify(r).includes(db), 'rejected line content is not echoed');
+    }
+  });
+
+  it('serverVersion (free text) is redacted; normal output is unchanged', () => {
+    const f = fixture({
+      password: 'pw-in-version',
+      stdout: lines(
+        '[db:migrate] target: database=fiyatucuz_adim14 user=u server=16.15 pw-in-version',
+        '[db:migrate] applied (0):',
+        '[db:migrate] pending (0):',
+      ),
+    });
+    const r = f.run('status');
+    assert.equal(r.ok, true);
+    assert.ok(!JSON.stringify(r).includes('pw-in-version'));
+    const normal = fixture({
+      password: 'pw-y-unused',
+      stdout: lines(
+        T,
+        '[db:migrate] applied (1):',
+        '  0001_foundation.sql',
+        '[db:migrate] pending (0):',
+      ),
+    }).run('status');
+    assert.deepEqual(normal, {
+      ok: true,
+      outcome: 'OK',
+      exitCode: 0,
+      applied: ['0001_foundation.sql'],
+      pending: [],
+      recordedMissing: [],
+      target: { database: 'fiyatucuz_adim14', serverVersion: '16.15' },
+      message: null,
+    });
+  });
+
+  it('malformed status still fails closed and the error carries no raw line content', () => {
+    const password = 'pw-malformed';
+    const f = fixture({
+      password,
+      stdout: lines(
+        T,
+        `junk ${password} line`,
+        '[db:migrate] applied (0):',
+        '[db:migrate] pending (0):',
+      ),
+    });
+    const r = f.run('status');
+    assert.deepEqual([r.ok, r.outcome], [false, 'STATUS_UNPARSEABLE']);
+    assert.ok(!JSON.stringify(r).includes(password));
+    assert.ok(!JSON.stringify(r).includes('junk'));
+  });
+
+  it('deploy-cli: collisions parse, recorded-but-missing still refuses, and no secret / URL / user reaches stdout or stderr', () => {
+    // Password overlaps the DB name and an ID; the operator-visible output may
+    // contain the identifiers themselves, never the URL or the user.
+    const f = fixture({
+      password: 'foundation',
+      stdout: lines(
+        T,
+        '[db:migrate] applied (1):',
+        '  0001_foundation.sql',
+        '[db:migrate] pending (0):',
+        '[db:migrate] recorded but missing from this checkout (1):',
+        '  0009_newer.sql',
+      ),
+    });
+    const res = spawnSync(
+      NODE,
+      [
+        DEPLOY_CLI,
+        'migration',
+        '--mode',
+        'status',
+        '--node',
+        NODE,
+        '--cli',
+        f.cli,
+        '--env-file',
+        f.envFile,
+      ],
+      { encoding: 'utf8' },
+    );
+    const out = JSON.parse(res.stdout);
+    assert.equal(res.status, 1);
+    assert.equal(out.outcome, 'RECORDED_BUT_MISSING');
+    assert.deepEqual(out.recordedMissing, ['0009_newer.sql']);
+    assert.deepEqual(out.before.applied, ['0001_foundation.sql']);
+    for (const text of [res.stdout, res.stderr]) {
+      assert.ok(!text.includes(f.url), 'URL leaked');
+      assert.ok(!text.includes('fiyatucuz_migrator'), 'migration user leaked');
+    }
+    // A non-colliding password must not appear anywhere.
+    const g = fixture({
+      password: 'pw-6C-never-visible',
+      code: 1,
+      stderr: 'boom pw-6C-never-visible\n',
+    });
+    const res2 = spawnSync(
+      NODE,
+      [
+        DEPLOY_CLI,
+        'migration',
+        '--mode',
+        'apply',
+        '--node',
+        NODE,
+        '--cli',
+        g.cli,
+        '--env-file',
+        g.envFile,
+        '--reviewed',
+        'x.sql',
+      ],
+      { encoding: 'utf8' },
+    );
+    assert.equal(res2.status, 1);
+    assert.ok(
+      !res2.stdout.includes('pw-6C-never-visible') && !res2.stderr.includes('pw-6C-never-visible'),
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ADIM 15A-6C.1 — pg_dump --version: parse raw, store only redacted text
+// ---------------------------------------------------------------------------
+
+describe('15A-6C.1 pg_dump version redaction correctness', () => {
+  /** Fake pg_dump / pg_restore; the version banner and exit code are configurable. */
+  function setup({ password, banner = 'pg_dump (PostgreSQL) 16.15', versionExit = 0 }) {
+    const dir = freshDir('g6c1');
+    const dumpRecord = join(dir, 'dump-ran');
+    const pgDump = fakeExe(
+      dir,
+      'pg_dump',
+      `const fs = require('fs');
+if (process.argv.includes('--version')) {
+  process.stdout.write(${JSON.stringify(`${banner}\r\n`)});
+  process.stderr.write('stderr noise ${password}\\n');
+  process.exit(${versionExit});
+}
+fs.writeFileSync(${JSON.stringify(dumpRecord)}, 'ran');
+fs.writeFileSync(process.argv[process.argv.indexOf('--file') + 1], 'PGDMP fake');`,
+    );
+    const pgRestore = fakeExe(dir, 'pg_restore', "process.stdout.write('; Archive created\\n');");
+    const url = `postgres://fiyatucuz_migrator:${password}@127.0.0.1:5432/fiyatucuz`;
+    const envObj = { DATABASE_MIGRATION_URL: url, DATABASE_MIGRATION_EXPECTED_DB: 'fiyatucuz' };
+    const envFile = join(dir, 'migration.env');
+    writeFileSync(
+      envFile,
+      Object.entries(envObj)
+        .map(([k, v]) => `${k}=${v}`)
+        .join('\n'),
+    );
+    const outFile = join(dir, 'b.dump');
+    const backup = () =>
+      runBackup({
+        pgDump,
+        pgRestore,
+        migrationEnv: env(envObj),
+        outFile,
+        parentEnv: { PATH: process.env.PATH },
+      });
+    return { dir, pgDump, pgRestore, url, envFile, outFile, dumpRecord, backup };
+  }
+  const FIELDS = [
+    'bytes',
+    'completedAt',
+    'createdAt',
+    'database',
+    'path',
+    'pgDumpMajor',
+    'pgDumpVersion',
+    'restoreListOk',
+    'sha256',
+  ];
+
+  it('A/B/C: a password that is a substring of the banner neither breaks parsing nor appears in the evidence', () => {
+    const f = setup({ password: 'Postgre' });
+    const r = f.backup();
+    assert.equal(r.pgDumpMajor, 16);
+    assert.ok(!r.pgDumpVersion.includes('Postgre'), r.pgDumpVersion);
+    assert.match(r.pgDumpVersion, /^pg_dump \(\[REDACTED\]SQL\) 16\.15$/);
+    assert.deepEqual(Object.keys(r).sort(), FIELDS);
+    const text = JSON.stringify(r);
+    for (const bad of ['Postgre', f.url, 'fiyatucuz_migrator']) assert.ok(!text.includes(bad), bad);
+  });
+
+  it('C: a secret inside the banner suffix is redacted; the major still comes from the raw line', () => {
+    const f = setup({
+      password: 'pw-in-banner-6C1',
+      banner: 'pg_dump (PostgreSQL) 17.2 (build pw-in-banner-6C1)',
+    });
+    const r = f.backup();
+    assert.equal(r.pgDumpMajor, 17);
+    assert.equal(r.pgDumpVersion, 'pg_dump (PostgreSQL) 17.2 (build [REDACTED])');
+  });
+
+  it('D/F: invalid banners still fail closed before any dump; no backup file; no raw text in the error', () => {
+    for (const banner of [
+      'pg_dump 16.15',
+      'pg_restore (PostgreSQL) 16.15',
+      '',
+      'pg_dump (PostgreSQL) x',
+      'pg_dump (PostgreSQL)16.15',
+    ]) {
+      const f = setup({ password: 'Postgre', banner });
+      assert.throws(
+        f.backup,
+        (e) =>
+          e.code === 'BACKUP_FAILED' &&
+          /output not recognized; backup not attempted/.test(e.message) &&
+          !e.message.includes('Postgre') &&
+          (banner === '' || !e.message.includes(banner)),
+        JSON.stringify(banner),
+      );
+      assert.equal(existsSync(f.dumpRecord), false, `dump ran for ${JSON.stringify(banner)}`);
+      assert.equal(existsSync(f.outFile), false);
+    }
+  });
+
+  it('E/F: a non-zero --version exit prevents the dump and creates no file; stderr is not echoed', () => {
+    const f = setup({ password: 'Postgre', versionExit: 4 });
+    assert.throws(
+      f.backup,
+      (e) =>
+        e.code === 'BACKUP_FAILED' &&
+        /--version failed \(exit 4\)/.test(e.message) &&
+        !e.message.includes('noise'),
+    );
+    assert.equal(existsSync(f.dumpRecord), false);
+    assert.equal(existsSync(f.outFile), false);
+  });
+
+  it('G: deploy-cli backup output carries no URL, user or password (success and failure)', () => {
+    const ok = setup({ password: 'Postgre' });
+    const run = (f) =>
+      spawnSync(
+        NODE,
+        [
+          DEPLOY_CLI,
+          'backup',
+          '--pg-dump',
+          f.pgDump,
+          '--pg-restore',
+          f.pgRestore,
+          '--env-file',
+          f.envFile,
+          '--out',
+          f.outFile,
+        ],
+        {
+          encoding: 'utf8',
+        },
+      );
+    const res = run(ok);
+    assert.equal(res.status, 0, res.stdout);
+    const b = JSON.parse(res.stdout).backup;
+    assert.deepEqual([b.pgDumpMajor, Object.keys(b).sort()], [16, FIELDS]);
+    const bad = setup({ password: 'Postgre', banner: 'garbage Postgre banner' });
+    const res2 = run(bad);
+    assert.equal(res2.status, 1);
+    for (const r of [res, res2]) {
+      for (const text of [r.stdout, r.stderr]) {
+        for (const secret of ['Postgre', ok.url, bad.url, 'fiyatucuz_migrator']) {
+          assert.ok(!text.includes(secret), `${secret} in CLI output`);
+        }
+      }
+    }
+  });
+
+  it('H: the full-path requirement is unchanged (checked before any probe)', () => {
+    const f = setup({ password: 'Postgre' });
+    assert.throws(
+      () => probePgDumpVersion('pg_dump', { secrets: ['Postgre'] }),
+      /fully qualified path/,
+    );
+    assert.equal(
+      probePgDumpVersion(f.pgDump, { secrets: ['Postgre'], parentEnv: { PATH: process.env.PATH } })
+        .pgDumpMajor,
+      16,
+    );
+  });
+});
+
 describe('G3 backup evidence', () => {
   function tools(dir, version = 'ok') {
     const dumpRecord = join(dir, 'dump.json');

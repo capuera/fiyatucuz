@@ -65,7 +65,7 @@ Task orchestration uses **pnpm scripts** and `pnpm -r <script>` recursion. Turbo
   - **Motivation** — why now.
   - **Contracts** — any API / DB / event change.
   - **Test plan** — checklist.
-- Required checks (once CI is set up): lint, typecheck, unit tests.
+- Required checks: the CI job in `.github/workflows/ci.yml` — format gate, lint, typecheck, build, tooling tests, migrations + integration tests. See [docs/development/ci.md](../docs/development/ci.md).
 - Squash-merge only.
 
 ## Environment
@@ -81,15 +81,16 @@ Task orchestration uses **pnpm scripts** and `pnpm -r <script>` recursion. Turbo
 
 ## Common tasks (once implemented)
 
-| Task            | Command                                                |
-| --------------- | ------------------------------------------------------ |
-| Format          | `pnpm format`                                          |
-| Lint            | `pnpm lint`                                            |
-| Typecheck       | `pnpm typecheck`                                       |
-| Test            | `pnpm test`                                            |
-| Build all       | `pnpm build`                                           |
-| Migration new   | `pnpm --filter @fiyatucuz/api db:migration:new <name>` |
-| Migration apply | `pnpm --filter @fiyatucuz/api db:migrate`              |
+| Task            | Command                                                           |
+| --------------- | ----------------------------------------------------------------- |
+| Format          | `pnpm format` (baseline-aware gate, see `docs/development/ci.md`) |
+| Tooling tests   | `pnpm run test:tooling`                                           |
+| Lint            | `pnpm lint`                                                       |
+| Typecheck       | `pnpm typecheck`                                                  |
+| Test            | `pnpm test`                                                       |
+| Build all       | `pnpm build`                                                      |
+| Migration new   | `pnpm --filter @fiyatucuz/api db:migration:new <name>`            |
+| Migration apply | `pnpm --filter @fiyatucuz/api db:migrate`                         |
 
 ## When adding a new package or service
 

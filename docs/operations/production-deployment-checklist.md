@@ -44,7 +44,7 @@ Never record a two-person review that did not happen.
 | Evidence                                                                                                  | Value / reference |
 | --------------------------------------------------------------------------------------------------------- | ----------------- |
 | Clean `prepare` at the commit                                                                             |                   |
-| Tests run for the commit (which suites, result) — CI alone is not sufficient (G5)                         |                   |
+| Green CI run for the exact commit (run link; [CI](../development/ci.md))                                  |                   |
 | Build / typecheck result                                                                                  |                   |
 | Known issues and disposition (no unresolved critical)                                                     |                   |
 | 15A-7 validation record                                                                                   |                   |

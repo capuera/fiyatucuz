@@ -10,6 +10,7 @@ Current contents:
 - `architecture/bounded-contexts.md` — bounded context registry with responsibilities.
 - `domain/ubiquitous-language.md` — canonical vocabulary.
 - `product/overview.md` — product model, actors, value flows.
+- `development/ci.md` — CI required checks, local equivalents, formatting baseline policy.
 
 Planned (add when the corresponding work begins):
 
