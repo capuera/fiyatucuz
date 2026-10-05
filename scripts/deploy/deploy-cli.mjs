@@ -20,6 +20,7 @@ import {
   DeployError,
   deploymentLayout,
   deriveReleaseId,
+  mergeReceiptPatch,
   parseEnvText,
   planActivationStep,
   pollHealth,
@@ -35,6 +36,7 @@ import {
   validateMigrationEnv,
   writeReceiptAtomic,
 } from './deploy-lib.mjs';
+import { verifySealedRelease } from '../release/release-lib.mjs';
 
 class UsageError extends Error {}
 
@@ -63,7 +65,6 @@ const list = (v) =>
         .map((s) => s.trim())
         .filter(Boolean)
     : [];
-const isPlainObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 const emit = (obj) => {
   process.stdout.write(`${JSON.stringify(obj)}\n`);
   return obj.ok === false ? 1 : 0;
@@ -107,6 +108,23 @@ async function main([command, ...rest]) {
       };
       const before = runMigrationCli({ ...base, mode: 'status' });
       if (!before.ok) return emit({ ...before, state: 'NOT_ATTEMPTED', attempted: false, before });
+      // The database records migrations this release does not contain: the
+      // release is older than the schema. Never treated as pending; every
+      // mode refuses before the apply command could run (fix-forward only).
+      if (before.recordedMissing.length > 0) {
+        return emit({
+          ok: false,
+          outcome: 'RECORDED_BUT_MISSING',
+          errors: [
+            `database records migrations missing from this release: ${before.recordedMissing.join(', ')}`,
+          ],
+          recordedMissing: before.recordedMissing,
+          state: 'NOT_ATTEMPTED',
+          attempted: false,
+          knownApplied: [],
+          before,
+        });
+      }
       if (o.mode === 'status') return emit({ ...before, before });
       if (before.pending.length === 0) {
         return emit({
@@ -136,13 +154,17 @@ async function main([command, ...rest]) {
       const apply = runMigrationCli({ ...base, mode: 'apply' });
       const after = runMigrationCli({ ...base, mode: 'status' });
       const c = classifyMigrationApply({ before, apply, after });
+      const missingAfter = after.ok ? after.recordedMissing : [];
       return emit({
-        ok: c.state === 'SUCCEEDED',
+        ok: c.state === 'SUCCEEDED' && missingAfter.length === 0,
         outcome: !apply.ok
           ? apply.outcome
-          : c.state === 'SUCCEEDED'
-            ? 'OK'
-            : `POST_STATUS_${c.state}`,
+          : missingAfter.length > 0
+            ? 'RECORDED_BUT_MISSING_AFTER_APPLY'
+            : c.state === 'SUCCEEDED'
+              ? 'OK'
+              : `POST_STATUS_${c.state}`,
+        recordedMissing: missingAfter,
         ...c,
         before,
         after: after.ok ? after : null,
@@ -270,14 +292,9 @@ async function main([command, ...rest]) {
       const o = parseOptions(rest, ['--file', '--patch', '--phase', '--result', '--secret-env']);
       need(o, 'file', 'phase', 'result');
       const secrets = list(o['secret-env']).flatMap((f) => secretsOf(readEnv(f)));
-      const receipt = readJson(o.file);
       const patch = o.patch ? readJson(o.patch) : {};
-      for (const [k, v] of Object.entries(patch)) {
-        if (k === 'events' || k === 'schemaVersion' || k === 'deploymentId') continue;
-        // One-level merge for sections (junctions, service, health …) so a
-        // later patch with { after } keeps the recorded { before }.
-        receipt[k] = isPlainObject(v) && isPlainObject(receipt[k]) ? { ...receipt[k], ...v } : v;
-      }
+      // Throws RECEIPT_IDENTITY_CONFLICT before anything is written.
+      const receipt = mergeReceiptPatch(readJson(o.file), patch);
       if (patch.status && !('databaseNote' in patch)) {
         receipt.databaseNote = databaseRollbackNote(patch.status, {
           state: receipt.migrations?.state,
@@ -287,6 +304,18 @@ async function main([command, ...rest]) {
       appendEvent(receipt, o.phase, o.result);
       writeReceiptAtomic(o.file, receipt, { secrets });
       return emit({ ok: true });
+    }
+    case 'release-identity': {
+      // Seal verification + the identity read from the verified bytes. On any
+      // verification error no identity is emitted.
+      const o = parseOptions(rest, ['--release', '--seal', '--seal-sha256']);
+      need(o, 'release', 'seal');
+      const r = verifySealedRelease({
+        releaseDir: o.release,
+        sealPath: o.seal,
+        expectedSealSha256: o['seal-sha256'],
+      });
+      return emit(r.ok ? { ok: true, identity: r.identity } : { ok: false, errors: r.errors });
     }
     case 'retention-report': {
       const o = parseOptions(rest, ['--releases', '--protect']);

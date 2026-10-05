@@ -82,7 +82,7 @@ The tooling runs from a **separate checkout** (`-ToolsRoot`) of the same commit;
    & <TOOLS_ROOT>\scripts\deploy\windows\Deploy-FiyatUcuzApi.ps1 -Phase Prepare -Root C:\FiyatUcuz -ToolsRoot <TOOLS_ROOT> -Archive <ARCHIVE_TGZ> -ArchiveSha256 <ARCHIVE_SHA256> -ManifestSha256 <MANIFEST_SHA256>
    ```
 
-4. **Review migrations** — read-only status, then a human review of every pending SQL file ([standard §6](production-operations-standard.md#6-migration-review-standard)). The tool does not and cannot prove that SQL is expand-only. Until gap G2 is fixed, also run the raw status command from the [checklist](production-deployment-checklist.md#read-only-verification-commands) to see "recorded but missing from this checkout" entries.
+4. **Review migrations** — read-only status, then a human review of every pending SQL file ([standard §6](production-operations-standard.md#6-migration-review-standard)). The tool does not and cannot prove that SQL is expand-only. The status reports `pending` and `recordedMissing` separately; if the database records migrations this release does not contain, the command exits `1` with `RECORDED_BUT_MISSING` and Activate refuses the release (fix-forward only).
 
    ```powershell
    # [STAGING] [READ-ONLY] migration status of the prepared release (no lock, no changes)
@@ -136,8 +136,8 @@ Every production command passes `-Root C:\FiyatUcuz` explicitly, as in the stagi
    - target seal (expected SHA-256);
    - junction precheck: every pointer absent or a valid junction, `current` → a release, no `current.next`, target ≠ current, first planned step is `createNext`;
    - the rollback target (current release) passes its own seal verification;
-   - migration status; if pending: `-ReviewedMigrations` equals the pending set (`--mode review`, nothing applied), `-PgDump` / `-PgRestore` exist.
-2. Backup (only if pending): `pg_dump` custom format, non-zero size, SHA-256, `pg_restore --list`. Failure → `FAILED_NO_CHANGE`, migration not attempted.
+   - migration status, parsed strictly (unrecognized output → `STATUS_UNPARSEABLE`); **no recorded-but-missing migrations** (`RECORDED_BUT_MISSING`: the release is older than the schema); if pending: `-ReviewedMigrations` equals the pending set (`--mode review`, nothing applied), `-PgDump` / `-PgRestore` exist and are full paths (drive letter; a bare name would be resolved through `PATH`).
+2. Backup (only if pending): `--version` of the exact `pg_dump` executable, then `pg_dump` custom format, non-zero size, SHA-256, `pg_restore --list`. Receipt evidence: path, database name, bytes, SHA-256, `restoreListOk`, `createdAt` / `completedAt` (UTC), `pgDumpVersion` / `pgDumpMajor`. Failure → `FAILED_NO_CHANGE`, migration not attempted.
 3. Apply → status → classification (receipt `migrations.state`, below). Anything but `SUCCEEDED` → stop, new release NOT activated.
 4. Re-verify the seal and the junction precheck immediately before activation.
 5. Stage `current.next` (and remove an old `current.prev`) while the service runs. Failure → `current.next` removed again, stop.
@@ -165,6 +165,8 @@ Every production command passes `-Root C:\FiyatUcuz` explicitly, as in the stagi
 ### Receipt rules
 
 - Written (atomic temp + fsync + rename, credential check) before the first mutation and at each phase.
+- `release.*` holds the **verified** identity (`id`, `gitCommit`, `manifestSha256`, `sealSha256`, `verifiedBy`): from Prepare's own hashes and from the verified seal (`deploy-cli release-identity`). It is write-once — a missing value never erases it, a different value fails closed with `RECEIPT_IDENTITY_CONFLICT`. Typed operator inputs are kept under `requested.*`.
+- `release.archiveSha256` is Prepare evidence (the hash Prepare computed). Activate leaves it `null`; the Prepare and Activate receipts link via release ID and manifest SHA-256.
 - Before the service is stopped, a failed receipt write stops the deployment.
 - After the swap began, safety wins: a receipt failure triggers the application rollback; rollback receipt writes are best effort.
 - A healthy deployment whose final receipt write fails is **not** rolled back; the script exits `3` and the receipt still says `IN_PROGRESS` (never a false `COMPLETED`).
@@ -213,6 +215,6 @@ In production these are `[PRODUCTION] [MUTATING]` and follow [incident-recovery.
 - `Get-NetTCPConnection` / `Win32_Process` output shape for the listener check.
 - WinSW stop behaviour, `<serviceaccount>` syntax for LocalService, `<stoptimeout>`.
 - NTFS hard-link detection (`nlink`) and effective LocalService access (ACLs are only checked statically).
-- `pg_dump` / `pg_restore` (tests use fake executables), backup duration vs the 10-minute child timeout.
+- `pg_dump` / `pg_restore` (tests use fake executables), the Windows `pg_dump --version` output format, backup duration vs the 10-minute child timeout.
 - Junction existence via `[System.IO.File]::GetAttributes` (dangling junctions), Windows `readlink` format for junctions inside the seal.
 - `tar.exe` output decoding of non-ASCII names through PowerShell; native stderr handling under remoting/ISE.

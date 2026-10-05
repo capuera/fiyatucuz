@@ -30,7 +30,7 @@ import {
   writeSync,
 } from 'node:fs';
 import { Buffer } from 'node:buffer';
-import { win32 } from 'node:path';
+import { posix, win32 } from 'node:path';
 import process from 'node:process';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { URL } from 'node:url';
@@ -334,17 +334,89 @@ function run(exe, args, { env, timeoutMs = 10 * 60 * 1000 } = {}) {
 // Migration wrapper (packages/db dist CLI, ADR-0019)
 // ---------------------------------------------------------------------------
 
+/**
+ * Strict parser for `migrate.js --status` (packages/db run-migrations.ts):
+ *
+ *   [db:migrate] target: database=<db> user=<user> server=<version>
+ *   [db:migrate] tracking table not found — no migrations recorded yet   (fresh DB only)
+ *   [db:migrate] applied (N):
+ *     <id>.sql
+ *   [db:migrate] pending (N):
+ *     <id>.sql
+ *   [db:migrate] recorded but missing from this checkout (N):            (only if N > 0)
+ *     <id>.sql
+ *
+ * Fails closed (DeployError STATUS_UNPARSEABLE) on anything else: unknown or
+ * reordered lines, missing/duplicate headers, count mismatches, malformed or
+ * duplicate IDs. The target user is never returned. Error messages carry line
+ * numbers and rule names only, never line content.
+ */
 export function parseMigrationStatus(stdout) {
-  const applied = [];
-  const pending = [];
-  let bucket = null;
-  for (const line of String(stdout).split(/\r?\n/)) {
-    if (/\] applied \(\d+\):/.test(line)) bucket = applied;
-    else if (/\] pending \(\d+\):/.test(line)) bucket = pending;
-    else if (/^\[db:migrate\]/.test(line)) bucket = null;
-    else if (bucket && /^\s{2}\S+\.sql$/.test(line)) bucket.push(line.trim());
+  const fail = (why) => {
+    throw new DeployError('STATUS_UNPARSEABLE', `migration status output not recognized: ${why}`);
+  };
+  const ID = /^ {2}([A-Za-z0-9][A-Za-z0-9._-]*\.sql)$/;
+  const SECTIONS = [
+    ['applied', /^\[db:migrate\] applied \((\d+)\):$/],
+    ['pending', /^\[db:migrate\] pending \((\d+)\):$/],
+    ['recordedMissing', /^\[db:migrate\] recorded but missing from this checkout \((\d+)\):$/],
+  ];
+  const lists = { applied: [], pending: [], recordedMissing: [] };
+  const declared = {};
+  let target = null;
+  let tracking = false;
+  let current = null;
+  let stage = 0; // 0 before target, 1 after target, 2.. after each section header
+  const seen = new Set();
+  const lines = String(stdout).split(/\r?\n/);
+  lines.forEach((raw, i) => {
+    const line = raw.replace(/\s+$/, '');
+    const at = `line ${i + 1}`;
+    if (line === '') return;
+    const t = /^\[db:migrate\] target: database=(\S+) user=.* server=(\S.*)$/.exec(line);
+    if (t) {
+      if (stage !== 0) fail(`${at}: unexpected target line`);
+      target = { database: t[1], serverVersion: t[2] };
+      stage = 1;
+      return;
+    }
+    if (/^\[db:migrate\] tracking table not found\b/.test(line)) {
+      if (stage !== 1 || tracking) fail(`${at}: unexpected tracking-table line`);
+      tracking = true;
+      return;
+    }
+    const idx = SECTIONS.findIndex(([, re]) => re.test(line));
+    if (idx >= 0) {
+      const [name, re] = SECTIONS[idx];
+      // Sections appear once, in order: applied, pending, recordedMissing.
+      if (stage !== idx + 1) fail(`${at}: unexpected ${name} header`);
+      declared[name] = Number(re.exec(line)[1]);
+      current = name;
+      stage = idx + 2;
+      return;
+    }
+    const id = ID.exec(line);
+    if (id) {
+      if (!current) fail(`${at}: migration id outside a section`);
+      if (seen.has(id[1])) fail(`${at}: duplicate migration id`);
+      seen.add(id[1]);
+      lists[current].push(id[1]);
+      return;
+    }
+    fail(`${at}: unknown line`);
+  });
+  if (!target) fail('target line missing');
+  if (!('applied' in declared) || !('pending' in declared)) fail('applied/pending header missing');
+  for (const [name] of SECTIONS) {
+    if (name in declared && declared[name] !== lists[name].length) fail(`${name} count mismatch`);
   }
-  return { applied, pending };
+  if ('recordedMissing' in declared && declared.recordedMissing === 0) {
+    fail('empty recorded-but-missing section');
+  }
+  if (tracking && (lists.applied.length > 0 || lists.recordedMissing.length > 0)) {
+    fail('tracking table reported missing but migrations are recorded');
+  }
+  return { ...lists, target };
 }
 
 function classifyMigrationFailure(code, stderr) {
@@ -390,6 +462,7 @@ export function runMigrationCli({
       exitCode: r.code,
       applied: [],
       pending: [],
+      recordedMissing: [],
       message: r.spawnError,
     };
   if (r.code !== 0) {
@@ -399,11 +472,36 @@ export function runMigrationCli({
       exitCode: r.code,
       applied: mode === 'apply' ? appliedNow : [],
       pending: [],
+      recordedMissing: [],
       message: stderr.split(/\r?\n/).find((l) => l.trim()) ?? 'migration CLI failed',
     };
   }
-  const status =
-    mode === 'status' ? parseMigrationStatus(stdout) : { applied: appliedNow, pending: [] };
+  if (mode === 'apply') {
+    return {
+      ok: true,
+      outcome: 'OK',
+      exitCode: 0,
+      applied: appliedNow,
+      pending: [],
+      recordedMissing: [],
+      message: null,
+    };
+  }
+  let status;
+  try {
+    status = parseMigrationStatus(stdout);
+  } catch (e) {
+    if (!(e instanceof DeployError)) throw e;
+    return {
+      ok: false,
+      outcome: e.code,
+      exitCode: 0,
+      applied: [],
+      pending: [],
+      recordedMissing: [],
+      message: e.message,
+    };
+  }
   return { ok: true, outcome: 'OK', exitCode: 0, ...status, message: null };
 }
 
@@ -505,6 +603,54 @@ function sha256FileStreaming(file) {
   return hash.digest('hex');
 }
 
+/**
+ * Backup tools must be given as fully qualified paths: a bare name would be
+ * resolved through PATH and a relative one against a working directory that
+ * can differ from the operator's shell location, so the executable that runs
+ * (and whose version is recorded) might not be the one that was checked.
+ */
+function assertFullPathExecutable(p, label) {
+  const s = String(p ?? '');
+  const ok = process.platform === 'win32' ? /^[A-Za-z]:[\\/]/.test(s) : posix.isAbsolute(s);
+  if (!ok) {
+    throw new DeployError(
+      'BACKUP_FAILED',
+      `${label} must be a fully qualified path; backup not attempted`,
+    );
+  }
+}
+
+/**
+ * Identify the EXACT pg_dump executable that will run the backup. No PG*
+ * variables are passed (the probe needs no credentials). Throws BACKUP_FAILED
+ * when it cannot run or its output is not a recognizable pg_dump version.
+ */
+export function probePgDumpVersion(pgDump, { parentEnv = process.env, secrets = [] } = {}) {
+  assertFullPathExecutable(pgDump, 'pg_dump');
+  const r = run(pgDump, ['--version'], { env: sanitizedChildEnv(parentEnv), timeoutMs: 30 * 1000 });
+  if (r.spawnError || r.code !== 0) {
+    throw new DeployError(
+      'BACKUP_FAILED',
+      `pg_dump --version failed (exit ${r.code}); backup not attempted`,
+    );
+  }
+  const first = redact(r.stdout.split(/\r?\n/)[0] ?? '', secrets).trim();
+  const m = /^pg_dump \(PostgreSQL\) (\d+)(?:\.\d+)*(?:\s.*)?$/.exec(first);
+  if (!m) {
+    throw new DeployError(
+      'BACKUP_FAILED',
+      'pg_dump --version output not recognized; backup not attempted',
+    );
+  }
+  return { pgDumpVersion: first.slice(0, 200), pgDumpMajor: Number(m[1]) };
+}
+
+/**
+ * Verified pre-migration backup. Evidence: path, database NAME only (from the
+ * validated migration config, equal to DATABASE_MIGRATION_EXPECTED_DB), size,
+ * SHA-256, pg_restore --list result, UTC timestamps and the pg_dump version of
+ * the exact executable used. Never a URL, user or password.
+ */
 export function runBackup({
   pgDump,
   pgRestore,
@@ -512,11 +658,17 @@ export function runBackup({
   outFile,
   parentEnv = process.env,
   timeoutMs,
+  now = () => new Date(),
 }) {
+  assertFullPathExecutable(pgDump, 'pg_dump');
+  assertFullPathExecutable(pgRestore, 'pg_restore');
   if (existsSync(outFile)) throw new DeployError('BACKUP_EXISTS', 'backup file already exists');
   const secrets = secretsOf(migrationEnv);
+  const pgEnv = pgEnvFromMigrationEnv(migrationEnv);
+  const version = probePgDumpVersion(pgDump, { parentEnv, secrets });
+  const createdAt = now().toISOString();
   const dump = run(pgDump, ['--format=custom', '--no-password', '--file', outFile], {
-    env: sanitizedChildEnv(parentEnv, pgEnvFromMigrationEnv(migrationEnv)),
+    env: sanitizedChildEnv(parentEnv, pgEnv),
     timeoutMs,
   });
   if (dump.spawnError || dump.code !== 0) {
@@ -540,7 +692,16 @@ export function runBackup({
   const restoreListOk = list.code === 0 && list.stdout.trim().length > 0;
   if (!restoreListOk)
     throw new DeployError('BACKUP_FAILED', 'pg_restore --list could not read the backup');
-  return { path: outFile, bytes, sha256, restoreListOk };
+  return {
+    path: outFile,
+    database: pgEnv.PGDATABASE,
+    bytes,
+    sha256,
+    restoreListOk,
+    createdAt,
+    completedAt: now().toISOString(),
+    ...version,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -980,12 +1141,23 @@ export function createReceipt(init) {
     host: init.host,
     operator: init.operator,
     tool: init.tool ?? null,
+    // Operator-supplied identifiers: input evidence only, never trusted.
+    requested: {
+      releaseId: init.releaseId || null,
+      archiveSha256: init.archiveSha256 || null,
+      manifestSha256: init.manifestSha256 || null,
+      sealSha256: init.sealSha256 || null,
+    },
+    // Verified identity (write-once, see mergeReceiptPatch). Filled only from
+    // verified data: Prepare's own archive hash / source verify, and the
+    // verified seal. archiveSha256 is Prepare evidence; Activate leaves it null.
     release: {
-      id: init.releaseId,
-      gitCommit: init.gitCommit,
-      archiveSha256: init.archiveSha256 ?? null,
-      manifestSha256: init.manifestSha256 ?? null,
+      id: null,
+      gitCommit: null,
+      manifestSha256: null,
       sealSha256: null,
+      archiveSha256: null,
+      verifiedBy: null,
     },
     previousRelease: init.previousRelease ?? null,
     backup: null,
@@ -1007,6 +1179,53 @@ export function createReceipt(init) {
     status: 'IN_PROGRESS',
     events: [],
   };
+}
+
+const RECEIPT_IDENTITY_FIELDS = [
+  'id',
+  'gitCommit',
+  'manifestSha256',
+  'sealSha256',
+  'archiveSha256',
+];
+const isPlainObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+
+/**
+ * Apply a receipt patch. Sections merge one level deep (a later { after }
+ * keeps the recorded { before }). Release identity is write-once: a null or
+ * absent value never erases it, the same value is accepted, a different value
+ * throws RECEIPT_IDENTITY_CONFLICT. Returns a new object; the input is never
+ * modified, so a refused patch leaves the stored receipt untouched.
+ */
+export function mergeReceiptPatch(receipt, patch) {
+  const next = JSON.parse(JSON.stringify(receipt));
+  for (const [k, v] of Object.entries(patch ?? {})) {
+    if (k === 'events' || k === 'schemaVersion' || k === 'deploymentId' || k === 'requested')
+      continue;
+    if (k === 'release') {
+      if (!isPlainObject(v))
+        throw new DeployError('RECEIPT_IDENTITY_CONFLICT', 'release patch must be an object');
+      const rel = isPlainObject(next.release) ? next.release : {};
+      for (const [field, value] of Object.entries(v)) {
+        if (!RECEIPT_IDENTITY_FIELDS.includes(field)) {
+          if (field === 'verifiedBy' && value != null) rel.verifiedBy = value;
+          continue;
+        }
+        if (value == null) continue;
+        if (rel[field] != null && rel[field] !== value) {
+          throw new DeployError(
+            'RECEIPT_IDENTITY_CONFLICT',
+            `receipt release.${field} is already recorded with a different value`,
+          );
+        }
+        rel[field] = value;
+      }
+      next.release = rel;
+      continue;
+    }
+    next[k] = isPlainObject(v) && isPlainObject(next[k]) ? { ...next[k], ...v } : v;
+  }
+  return next;
 }
 
 export function appendEvent(receipt, phase, result, at = new Date().toISOString()) {

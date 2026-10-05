@@ -50,7 +50,7 @@ Never record a two-person review that did not happen.
 | 15A-7 validation record                                                                                   |                   |
 | Per-release staging rehearsal (required for B–D)                                                          |                   |
 | Migration status: pending list                                                                            |                   |
-| Migration status: "recorded but missing from this checkout" (must be empty, G2)                           |                   |
+| Migration status: "recorded but missing from this checkout" (must be empty; Activate refuses otherwise)   |                   |
 | Migration review (per file, [standard §6](production-operations-standard.md#6-migration-review-standard)) |                   |
 | pg_dump / pg_restore paths and versions; DB server version                                                |                   |
 | Free disk on `C:`                                                                                         |                   |
@@ -76,7 +76,7 @@ All must be true. Any "no" or "unknown" is NO-GO.
 
 Only when migrations are pending. All must be true.
 
-- [ ] Read-only status shows the expected pending set and **no** "recorded but missing from this checkout" entries (G2 — manual until fixed)
+- [ ] Read-only status shows the expected pending set and **no** "recorded but missing from this checkout" entries (Activate refuses them: `RECORDED_BUT_MISSING`)
 - [ ] Reviewed list (`-ReviewedMigrations`) equals the pending set exactly
 - [ ] Expected database matches the target (wrong DB → NO-GO)
 - [ ] pg_dump / pg_restore present; pg_dump major version ≥ server major version
@@ -103,6 +103,8 @@ The Activate read-only gate checks these automatically; the operator records the
 All on the production server unless stated; all **read-only**. Any failure → follow [incident-recovery.md](incident-recovery.md).
 
 - [ ] Receipt final status `COMPLETED`
+- [ ] Receipt `release.gitCommit`, `release.manifestSha256`, `release.sealSha256` equal the approved values (verified identity; `requested.*` only holds the typed inputs)
+- [ ] For migration deployments: receipt `backup` shows database name, `createdAt`, `completedAt`, `pgDumpVersion`, SHA-256 and `restoreListOk: true`
 - [ ] `FiyatUcuzApi` Running
 - [ ] Local `/health` → 200 and `{"status":"ok"}`
 - [ ] Only listener on port 4000 is `127.0.0.1:4000`
@@ -140,14 +142,11 @@ Get-Item -LiteralPath C:\FiyatUcuz\current -Force | Select-Object FullName, Link
 & C:\FiyatUcuz\runtime\node22\node.exe <TOOLS_ROOT>\scripts\deploy\deploy-cli.mjs validate-api-env --file C:\FiyatUcuz\config\api.env --root C:\FiyatUcuz
 ```
 
-Migration status (read-only, takes no lock). Until G2 is fixed, the raw CLI output is the only place "recorded but missing from this checkout" is shown. The session must not define migration variables itself, because `--env-file` does not override existing variables:
+Migration status (read-only, takes no lock). `deploy-cli` runs the migration CLI with a sanitized environment and reports `applied`, `pending` and `recordedMissing` (no credentials, no database user). It exits `1` with `RECORDED_BUT_MISSING` when the database records migrations the release does not contain — expected after `ROLLED_BACK_APP_ONLY`, a NO-GO otherwise:
 
 ```powershell
-# [PRODUCTION] [READ-ONLY] must print False
-Test-Path Env:DATABASE_MIGRATION_URL
-
-# [PRODUCTION] [READ-ONLY] applied / pending / recorded-but-missing; prints database, user and server version, no secrets
-& C:\FiyatUcuz\runtime\node22\node.exe --env-file=C:\FiyatUcuz\config\migration.env C:\FiyatUcuz\current\packages\db\dist\cli\migrate.js --status
+# [PRODUCTION] [READ-ONLY] migration status of the active release
+& C:\FiyatUcuz\runtime\node22\node.exe <TOOLS_ROOT>\scripts\deploy\deploy-cli.mjs migration --mode status --node C:\FiyatUcuz\runtime\node22\node.exe --cli C:\FiyatUcuz\current\packages\db\dist\cli\migrate.js --env-file C:\FiyatUcuz\config\migration.env
 ```
 
 External health — from a machine **outside** the server:

@@ -49,7 +49,10 @@ import {
   deriveReleaseId,
   FINAL_STATUS,
   parseEnvText,
+  mergeReceiptPatch,
+  parseMigrationStatus,
   pgEnvFromMigrationEnv,
+  probePgDumpVersion,
   planActivationStep,
   pollHealth,
   precheckActivation,
@@ -264,9 +267,16 @@ describe('release seal', () => {
       expectedManifestSha256: r.manifestSha256,
     });
     assert.match(sealSha256, /^[0-9a-f]{64}$/);
+    // G1: identity is returned only after successful verification.
     assert.deepEqual(verifySealedRelease({ ...r, expectedSealSha256: sealSha256 }), {
       ok: true,
       errors: [],
+      identity: {
+        releaseId: '20261004-aaaaaaaaaaaa',
+        gitCommit: 'a'.repeat(40),
+        manifestSha256: r.manifestSha256,
+        sealSha256,
+      },
     });
   });
 
@@ -619,12 +629,20 @@ describe('receipt', () => {
 // ---------------------------------------------------------------------------
 
 describe('backup', () => {
-  function fakes(dir, { dump = 'ok', restore = 'ok' } = {}) {
+  function fakes(dir, { dump = 'ok', restore = 'ok', version = 'ok' } = {}) {
     const record = join(dir, 'record.json');
+    const versionRecord = join(dir, 'version.json');
     const pgDump = fakeExe(
       dir,
       'pg_dump',
       `const fs = require('fs');
+if (process.argv.includes('--version')) {
+  fs.writeFileSync(${JSON.stringify(versionRecord)}, JSON.stringify({ argv: process.argv.slice(2), env: process.env }));
+  const v = ${JSON.stringify(version)};
+  if (v === 'fail') { process.stderr.write('broken\\n'); process.exit(3); }
+  process.stdout.write(v === 'garbage' ? 'not a pg_dump\\n' : 'pg_dump (PostgreSQL) 16.4 (Debian 16.4-1)\\n');
+  process.exit(0);
+}
 const out = process.argv[process.argv.indexOf('--file') + 1];
 fs.writeFileSync(${JSON.stringify(record)}, JSON.stringify({ argv: process.argv.slice(2), env: process.env }));
 if (${JSON.stringify(dump)} === 'fail') { process.stderr.write('connection failed for password ' + process.env.PGPASSWORD + '\\n'); process.exit(1); }
@@ -635,7 +653,7 @@ fs.writeFileSync(out, ${JSON.stringify(dump)} === 'empty' ? '' : 'PGDMP fake cus
       'pg_restore',
       `if (${JSON.stringify(restore)} === 'fail') process.exit(1); process.stdout.write('; Archive created\\n');`,
     );
-    return { pgDump, pgRestore, record };
+    return { pgDump, pgRestore, record, versionRecord };
   }
   const parent = {
     PATH: process.env.PATH,
@@ -751,10 +769,19 @@ if (mode === 'lock') { process.stderr.write('MigrationLockUnavailableError: lock
 if (mode === 'mismatch') { process.stderr.write('MigrationTargetMismatchError: wrong db\\n'); process.exit(1); }
 if (process.argv.includes('--status')) {
   if (state.broken) { process.stderr.write('Error: connection lost\\n'); process.exit(1); }
+  if (mode === 'garbage') { console.log('[db:migrate] something else entirely'); process.exit(0); }
+  const missing = state.missing || [];
+  console.log('[db:migrate] target: database=fiyatucuz user=fiyatucuz_migrator server=16.4');
+  if (state.fresh) console.log('[db:migrate] tracking table not found \u2014 no migrations recorded yet');
   console.log('[db:migrate] applied (' + state.applied.length + '):'); state.applied.forEach((m) => console.log('  ' + m));
   console.log('[db:migrate] pending (' + state.pending.length + '):'); state.pending.forEach((m) => console.log('  ' + m));
+  if (missing.length > 0) {
+    console.log('[db:migrate] recorded but missing from this checkout (' + missing.length + '):'); missing.forEach((m) => console.log('  ' + m));
+  }
   process.exit(0);
 }
+fs.writeFileSync(process.env.FAKE_STATE + '.apply-invoked', 'yes');
+if (mode === 'missing-after-apply') { state.missing = ['0099_newer.sql']; }
 if (mode === 'fail-after-first') {
   const first = state.pending.shift(); state.applied.push(first);
   fs.writeFileSync(process.env.FAKE_STATE, JSON.stringify(state));
@@ -779,10 +806,16 @@ fs.writeFileSync(process.env.FAKE_STATE, JSON.stringify(state));`,
     return cli;
   }
 
-  function setup({ applied = ['0001_a.sql'], pending = ['0002_b.sql'], mode = 'ok' } = {}) {
+  function setup({
+    applied = ['0001_a.sql'],
+    pending = ['0002_b.sql'],
+    missing = [],
+    fresh = false,
+    mode = 'ok',
+  } = {}) {
     const dir = freshDir('mig');
     const state = join(dir, 'state.json');
-    writeFileSync(state, JSON.stringify({ applied, pending }));
+    writeFileSync(state, JSON.stringify({ applied, pending, missing, fresh }));
     const envFile = join(dir, 'migration.env');
     writeFileSync(
       envFile,
@@ -1687,6 +1720,765 @@ describe('review fixes', () => {
     );
     assert.equal(p.status, 1);
     assert.equal(JSON.parse(p.stdout).ok, false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ADIM 15A-6A — G1 verified receipt identity
+// ---------------------------------------------------------------------------
+
+describe('G1 verified receipt identity', () => {
+  const SEAL_ID = '20261004-aaaaaaaaaaaa';
+  function sealed() {
+    const releaseDir = join(freshDir('g1'), SEAL_ID);
+    const { manifest, manifestSha256 } = prepareRelease({
+      repoRoot: REPO_ROOT,
+      outputDir: releaseDir,
+      git: { head: 'c'.repeat(40), clean: true, commitTime: '2026-10-04T00:00:00Z' },
+    });
+    const pkg = join(releaseDir, 'node_modules/.pnpm/zod@3.25.76/node_modules/zod');
+    mkdirSync(pkg, { recursive: true });
+    writeFileSync(join(pkg, 'index.js'), 'module.exports = {};');
+    for (const rel of manifest.requiredBuildOutputs) {
+      mkdirSync(dirname(join(releaseDir, rel)), { recursive: true });
+      writeFileSync(join(releaseDir, rel), 'export {};');
+    }
+    const sealPath = `${releaseDir}.seal.json`;
+    const { sealSha256 } = sealRelease({
+      releaseDir,
+      sealPath,
+      releaseId: SEAL_ID,
+      expectedManifestSha256: manifestSha256,
+    });
+    return { releaseDir, sealPath, manifestSha256, sealSha256 };
+  }
+  const identityCli = (r, sha) =>
+    spawnSync(
+      NODE,
+      [
+        DEPLOY_CLI,
+        'release-identity',
+        '--release',
+        r.releaseDir,
+        '--seal',
+        r.sealPath,
+        ...(sha ? ['--seal-sha256', sha] : []),
+      ],
+      {
+        encoding: 'utf8',
+      },
+    );
+
+  it('release-identity emits identity from the verified seal + manifest (Prepare and Activate path)', () => {
+    const r = sealed();
+    const res = identityCli(r, r.sealSha256);
+    assert.equal(res.status, 0, res.stdout);
+    assert.deepEqual(JSON.parse(res.stdout).identity, {
+      releaseId: SEAL_ID,
+      gitCommit: 'c'.repeat(40),
+      manifestSha256: r.manifestSha256,
+      sealSha256: r.sealSha256,
+    });
+  });
+
+  it('tampered tree, wrong seal digest or invalid seal identity emit no identity', () => {
+    const r = sealed();
+    const wrong = identityCli(r, 'e'.repeat(64));
+    assert.equal(wrong.status, 1);
+    assert.equal(JSON.parse(wrong.stdout).identity, undefined);
+
+    writeFileSync(join(r.releaseDir, 'services/api/dist/index.js'), 'export const evil = 1;');
+    const tampered = identityCli(r, r.sealSha256);
+    assert.equal(tampered.status, 1);
+    assert.equal(JSON.parse(tampered.stdout).identity, undefined);
+
+    // A seal without a valid manifest digest must not skip the manifest binding.
+    const r2 = sealed();
+    const seal = JSON.parse(readFileSync(r2.sealPath, 'utf8'));
+    delete seal.manifestSha256;
+    writeFileSync(r2.sealPath, `${JSON.stringify(seal, null, 2)}\n`);
+    const res = verifySealedRelease({ releaseDir: r2.releaseDir, sealPath: r2.sealPath });
+    assert.equal(res.ok, false);
+    assert.ok(res.errors.includes('seal manifest digest invalid'));
+    assert.equal(res.identity, undefined);
+  });
+
+  const base = () =>
+    createReceipt({
+      deploymentId: 'd',
+      releaseId: '20261004-ffffffffffff',
+      archiveSha256: 'f'.repeat(64),
+      sealSha256: '',
+    });
+
+  it('operator inputs are stored as requested, never as verified identity', () => {
+    const r = base();
+    assert.deepEqual(r.release, {
+      id: null,
+      gitCommit: null,
+      manifestSha256: null,
+      sealSha256: null,
+      archiveSha256: null,
+      verifiedBy: null,
+    });
+    assert.deepEqual(r.requested, {
+      releaseId: '20261004-ffffffffffff',
+      archiveSha256: 'f'.repeat(64),
+      manifestSha256: null,
+      sealSha256: null,
+    });
+    // A patch cannot rewrite the requested inputs either.
+    assert.equal(
+      mergeReceiptPatch(r, { requested: { releaseId: 'x' } }).requested.releaseId,
+      '20261004-ffffffffffff',
+    );
+  });
+
+  it('write-once: Prepare archive hash, then seal identity; null/absent never erase; same value allowed', () => {
+    let r = base();
+    r = mergeReceiptPatch(r, { release: { archiveSha256: 'a'.repeat(64), verifiedBy: 'prepare' } });
+    r = mergeReceiptPatch(r, {
+      release: { id: SEAL_ID, manifestSha256: 'b'.repeat(64), verifiedBy: 'prepare' },
+    });
+    r = mergeReceiptPatch(r, {
+      release: {
+        id: SEAL_ID,
+        gitCommit: 'c'.repeat(40),
+        manifestSha256: 'b'.repeat(64),
+        sealSha256: 'd'.repeat(64),
+        verifiedBy: 'seal',
+      },
+    });
+    r = mergeReceiptPatch(r, {
+      release: { id: null, gitCommit: null, archiveSha256: null },
+      status: 'PREPARED',
+    });
+    r = mergeReceiptPatch(r, { release: {} });
+    assert.deepEqual(r.release, {
+      id: SEAL_ID,
+      gitCommit: 'c'.repeat(40),
+      manifestSha256: 'b'.repeat(64),
+      sealSha256: 'd'.repeat(64),
+      archiveSha256: 'a'.repeat(64),
+      verifiedBy: 'seal',
+    });
+  });
+
+  it('Activate identity has no archive hash (Prepare-only evidence)', () => {
+    let r = base();
+    r = mergeReceiptPatch(r, {
+      release: {
+        id: SEAL_ID,
+        gitCommit: 'c'.repeat(40),
+        manifestSha256: 'b'.repeat(64),
+        sealSha256: 'd'.repeat(64),
+        verifiedBy: 'seal',
+      },
+    });
+    assert.equal(r.release.archiveSha256, null);
+  });
+
+  it('merge never mutates its input, on success or on conflict (review)', () => {
+    const r = mergeReceiptPatch(base(), {
+      release: { id: SEAL_ID, gitCommit: 'c'.repeat(40) },
+      junctions: { before: { current: 'x' } },
+    });
+    const snapshot = JSON.stringify(r);
+    const ok = mergeReceiptPatch(r, { junctions: { after: { current: 'y' } }, status: 'X' });
+    assert.equal(JSON.stringify(r), snapshot, 'input unchanged after success');
+    assert.deepEqual(ok.junctions, { before: { current: 'x' }, after: { current: 'y' } });
+    assert.deepEqual(ok.release, r.release, 'unrelated sections keep identity');
+    assert.throws(
+      () => mergeReceiptPatch(r, { status: 'Y', release: { gitCommit: '9'.repeat(40) } }),
+      (e) => e.code === 'RECEIPT_IDENTITY_CONFLICT',
+    );
+    assert.equal(
+      JSON.stringify(r),
+      snapshot,
+      'input unchanged after conflict (even keys before the conflicting one)',
+    );
+  });
+
+  it('conflicting identity fails closed; the stored receipt is unchanged', () => {
+    const dir = freshDir('g1r');
+    const file = join(dir, 'r.json');
+    writeReceiptAtomic(
+      file,
+      mergeReceiptPatch(base(), { release: { id: SEAL_ID, gitCommit: 'c'.repeat(40) } }),
+    );
+    const before = readFileSync(file, 'utf8');
+    for (const release of [{ gitCommit: '9'.repeat(40) }, { id: '20261004-bbbbbbbbbbbb' }]) {
+      const p = join(dir, `p-${(counter += 1)}.json`);
+      writeFileSync(p, JSON.stringify({ release, status: 'COMPLETED' }));
+      const res = spawnSync(
+        NODE,
+        [
+          DEPLOY_CLI,
+          'receipt-update',
+          '--file',
+          file,
+          '--patch',
+          p,
+          '--phase',
+          'x',
+          '--result',
+          'x',
+        ],
+        { encoding: 'utf8' },
+      );
+      assert.equal(res.status, 1);
+      assert.equal(JSON.parse(res.stdout).code, 'RECEIPT_IDENTITY_CONFLICT');
+      assert.equal(readFileSync(file, 'utf8'), before, 'receipt untouched');
+    }
+    assert.deepEqual(
+      readdirSync(dir).filter((f) => f.includes('.tmp-')),
+      [],
+    );
+    assert.throws(
+      () => mergeReceiptPatch(base(), { release: 'x' }),
+      (e) => e.code === 'RECEIPT_IDENTITY_CONFLICT',
+    );
+  });
+
+  it('identity output and receipts carry no secret', () => {
+    const r = sealed();
+    const res = identityCli(r, r.sealSha256);
+    assert.ok(!/postgres|password|DATABASE_/i.test(res.stdout));
+  });
+
+  it('Deploy script takes identity from release-identity, never from caller arguments', () => {
+    const ps = stripPsComments(readFileSync(join(WINDOWS_DIR, 'Deploy-FiyatUcuzApi.ps1'), 'utf8'));
+    assert.ok(!/gitCommit\s*=\s*\$null/.test(ps), 'no gitCommit = $null');
+    assert.ok(
+      !/release\s*=\s*@\{[^}]*\$(ReleaseId|SealSha256|ManifestSha256|ArchiveSha256)\b/.test(ps),
+      'no operator argument in release patch',
+    );
+    assert.ok(/'release-identity'/.test(ps));
+    // Target seal checks use the identity path (gate + re-verify) and Prepare re-verifies the new seal.
+    assert.equal((ps.match(/Get-VerifiedIdentity -Dir \$releaseDir/g) ?? []).length, 3);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ADIM 15A-6A — G2 recorded-but-missing migration guard
+// ---------------------------------------------------------------------------
+
+describe('G2 migration status parser', () => {
+  const T = '[db:migrate] target: database=fiyatucuz user=fiyatucuz_migrator server=16.4 (Debian)';
+  const status = (...lines) => lines.join('\n');
+  const unparseable = (text, why) =>
+    assert.throws(
+      () => parseMigrationStatus(text),
+      (e) => e.code === 'STATUS_UNPARSEABLE',
+      why,
+    );
+
+  it('normal status: applied / pending, target without the user', () => {
+    const r = parseMigrationStatus(
+      status(
+        T,
+        '[db:migrate] applied (1):',
+        '  0001_a.sql',
+        '[db:migrate] pending (1):',
+        '  0002_b.sql',
+      ),
+    );
+    assert.deepEqual(r, {
+      applied: ['0001_a.sql'],
+      pending: ['0002_b.sql'],
+      recordedMissing: [],
+      target: { database: 'fiyatucuz', serverVersion: '16.4 (Debian)' },
+    });
+    assert.ok(!JSON.stringify(r).includes('fiyatucuz_migrator'));
+  });
+
+  it('one and several recorded-but-missing IDs are returned separately (not as pending)', () => {
+    const one = parseMigrationStatus(
+      status(
+        T,
+        '[db:migrate] applied (1):',
+        '  0001_a.sql',
+        '[db:migrate] pending (0):',
+        '[db:migrate] recorded but missing from this checkout (1):',
+        '  0007_x.sql',
+      ),
+    );
+    assert.deepEqual([one.pending, one.recordedMissing], [[], ['0007_x.sql']]);
+    const many = parseMigrationStatus(
+      status(
+        T,
+        '[db:migrate] applied (0):',
+        '[db:migrate] pending (1):',
+        '  0002_b.sql',
+        '[db:migrate] recorded but missing from this checkout (2):',
+        '  0007_x.sql',
+        '  0008_y.sql',
+      ),
+    );
+    assert.deepEqual(
+      [many.pending, many.recordedMissing],
+      [['0002_b.sql'], ['0007_x.sql', '0008_y.sql']],
+    );
+  });
+
+  it('fresh database (tracking table not found) is accepted; inconsistent use of it is not', () => {
+    const r = parseMigrationStatus(
+      status(
+        T,
+        '[db:migrate] tracking table not found — no migrations recorded yet',
+        '[db:migrate] applied (0):',
+        '[db:migrate] pending (1):',
+        '  0001_a.sql',
+      ),
+    );
+    assert.deepEqual(r.pending, ['0001_a.sql']);
+    unparseable(
+      status(
+        T,
+        '[db:migrate] tracking table not found — x',
+        '[db:migrate] applied (1):',
+        '  0001_a.sql',
+        '[db:migrate] pending (0):',
+      ),
+    );
+  });
+
+  it('CRLF and trailing whitespace are accepted', () => {
+    const r = parseMigrationStatus(
+      `${T}  \r\n[db:migrate] applied (1):\t\r\n  0001_a.sql \r\n[db:migrate] pending (0):\r\n\r\n`,
+    );
+    assert.deepEqual(r.applied, ['0001_a.sql']);
+  });
+
+  it('fails closed on empty, truncated, reordered, mismatched, unknown, duplicate or malformed output', () => {
+    const A = '[db:migrate] applied (1):';
+    const P = '[db:migrate] pending (0):';
+    unparseable('', 'empty');
+    unparseable('\n\n', 'blank');
+    unparseable(status(T, A, '  0001_a.sql'), 'pending header missing');
+    unparseable(status(A, '  0001_a.sql', P), 'target missing');
+    unparseable(status(T, P, A, '  0001_a.sql'), 'reordered');
+    unparseable(status(T, A, '  0001_a.sql', P, P), 'duplicate header');
+    unparseable(status(T, T, A, '  0001_a.sql', P), 'duplicate target');
+    unparseable(status(T, '[db:migrate] applied (2):', '  0001_a.sql', P), 'count mismatch');
+    unparseable(status(T, A, '  0001_a.sql', P, 'WARNING: something'), 'unknown line');
+    unparseable(
+      status(T, '[db:migrate] applied (2):', '  0001_a.sql', '  0001_a.sql', P),
+      'duplicate in section',
+    );
+    unparseable(
+      status(
+        T,
+        A,
+        '  0001_a.sql',
+        P,
+        '[db:migrate] recorded but missing from this checkout (1):',
+        '  0001_a.sql',
+      ),
+      'duplicate across sections',
+    );
+    unparseable(status(T, A, '  0001_a.txt', P), 'malformed id');
+    unparseable(status(T, A, '    0001_a.sql', P), 'wrong indentation');
+    unparseable(status(T, A, '  ../0001_a.sql', P), 'path-like id');
+    unparseable(
+      status(
+        T,
+        '[db:migrate] applied (0):',
+        P,
+        '[db:migrate] recorded but missing from this checkout (0):',
+      ),
+      'empty missing section',
+    );
+    // Review additions: invalid counts, fake/indented headers, hostile IDs.
+    unparseable(status(T, '[db:migrate] applied (-1):', P), 'negative count');
+    unparseable(status(T, '[db:migrate] applied (x):', P), 'non-numeric count');
+    unparseable(status(T, ' [db:migrate] applied (0):', P), 'indented header');
+    unparseable(status(T, A, '  [db:migrate] pending (0):', P), 'header disguised as id');
+    unparseable(status(T, A, '  0001_a.sql; rm -rf /', P), 'command-like id');
+    unparseable(status(T, A, '  C:\\x\\0001_a.sql', P), 'absolute id');
+    unparseable(
+      status(T, A, '  0001_a.sql', P, '[db:migrate] Done: 0 applied, 0 skipped.'),
+      'apply-mode line in status',
+    );
+  });
+
+  it('accepts every legitimate form of the real CLI, including all existing migration file names', () => {
+    const real = readdirSync(join(REPO_ROOT, 'packages/db/drizzle'))
+      .filter((f) => f.endsWith('.sql'))
+      .sort();
+    assert.ok(real.length > 0);
+    const forms = [
+      status(
+        T,
+        `[db:migrate] applied (${real.length}):`,
+        ...real.map((id) => `  ${id}`),
+        '[db:migrate] pending (0):',
+      ),
+      status(
+        T,
+        '[db:migrate] applied (0):',
+        `[db:migrate] pending (${real.length}):`,
+        ...real.map((id) => `  ${id}`),
+      ),
+      status(
+        T,
+        '[db:migrate] tracking table not found — no migrations recorded yet',
+        '[db:migrate] applied (0):',
+        '[db:migrate] pending (0):',
+      ),
+      `${status(T, '[db:migrate] applied (1):', `  ${real[0]}`, '[db:migrate] pending (0):', '[db:migrate] recorded but missing from this checkout (1):', '  0999_future.sql')}\n`,
+    ];
+    for (const f of forms) assert.doesNotThrow(() => parseMigrationStatus(f));
+    assert.deepEqual(parseMigrationStatus(forms[0]).applied, real);
+  });
+
+  it('unparseable status from the CLI is reported as STATUS_UNPARSEABLE (ok:false), never as "nothing pending"', () => {
+    const dir = freshDir('g2');
+    const cli = join(dir, 'migrate.js');
+    writeFileSync(cli, "process.stdout.write('');");
+    const emptyEnv = join(dir, 'empty.env');
+    writeFileSync(emptyEnv, '');
+    const r = runMigrationCli({
+      node: NODE,
+      migrateCli: cli,
+      migrationEnvFile: emptyEnv,
+      mode: 'status',
+      parentEnv: { PATH: process.env.PATH },
+    });
+    assert.deepEqual([r.ok, r.outcome, r.pending], [false, 'STATUS_UNPARSEABLE', []]);
+  });
+});
+
+describe('G2 recorded-but-missing guard (deploy-cli)', () => {
+  // Same fake CLI contract as the migration wrapper tests (real output format).
+  function fake({ applied = ['0001_a.sql'], pending = [], missing = [], mode = 'ok' } = {}) {
+    const dir = freshDir('g2cli');
+    const state = join(dir, 'state.json');
+    writeFileSync(state, JSON.stringify({ applied, pending, missing }));
+    const envFile = join(dir, 'migration.env');
+    writeFileSync(
+      envFile,
+      [
+        `DATABASE_MIGRATION_URL=${MIGRATION_URL}`,
+        'DATABASE_MIGRATION_EXPECTED_DB=fiyatucuz',
+        `FAKE_STATE=${state}`,
+        `FAKE_MODE=${mode}`,
+      ].join('\n'),
+    );
+    const cli = join(dir, 'migrate.js');
+    writeFileSync(
+      cli,
+      `const fs = require('fs');
+const state = JSON.parse(fs.readFileSync(process.env.FAKE_STATE, 'utf8'));
+if (process.argv.includes('--status')) {
+  if (process.env.FAKE_MODE === 'garbage') { console.log('[db:migrate] ???'); process.exit(0); }
+  const m = state.missing || [];
+  console.log('[db:migrate] target: database=fiyatucuz user=fiyatucuz_migrator server=16.4');
+  console.log('[db:migrate] applied (' + state.applied.length + '):'); state.applied.forEach((x) => console.log('  ' + x));
+  console.log('[db:migrate] pending (' + state.pending.length + '):'); state.pending.forEach((x) => console.log('  ' + x));
+  if (m.length) { console.log('[db:migrate] recorded but missing from this checkout (' + m.length + '):'); m.forEach((x) => console.log('  ' + x)); }
+  process.exit(0);
+}
+fs.writeFileSync(process.env.FAKE_STATE + '.apply-invoked', 'yes');
+for (const x of state.pending) console.log('[db:migrate] Applied ' + x);
+state.applied.push(...state.pending); state.pending = [];
+if (process.env.FAKE_MODE === 'missing-after-apply') state.missing = ['0099_newer.sql'];
+fs.writeFileSync(process.env.FAKE_STATE, JSON.stringify(state));`,
+    );
+    return { state, envFile, cli };
+  }
+  const run = (f, mode, reviewed) => {
+    const r = spawnSync(
+      NODE,
+      [
+        DEPLOY_CLI,
+        'migration',
+        '--mode',
+        mode,
+        '--node',
+        NODE,
+        '--cli',
+        f.cli,
+        '--env-file',
+        f.envFile,
+        ...(reviewed ? ['--reviewed', reviewed] : []),
+      ],
+      { encoding: 'utf8' },
+    );
+    assert.ok(
+      !r.stdout.includes(SECRET_PW) && !r.stdout.includes('fiyatucuz_migrator'),
+      'no secret / user in output',
+    );
+    return { code: r.status, out: JSON.parse(r.stdout) };
+  };
+  const applyInvoked = (f) => existsSync(`${f.state}.apply-invoked`);
+
+  it('no recorded-but-missing: status ok with structured lists', () => {
+    const { code, out } = run(fake({ pending: ['0002_b.sql'] }), 'status');
+    assert.equal(code, 0);
+    assert.deepEqual([out.pending, out.recordedMissing], [['0002_b.sql'], []]);
+  });
+
+  for (const mode of ['status', 'review', 'apply']) {
+    it(`${mode}: recorded-but-missing (with pending too) is refused before any apply, IDs preserved`, () => {
+      const f = fake({ pending: ['0002_b.sql'], missing: ['0007_x.sql', '0008_y.sql'] });
+      const { code, out } = run(f, mode, '0002_b.sql');
+      assert.equal(code, 1);
+      assert.equal(out.outcome, 'RECORDED_BUT_MISSING');
+      assert.deepEqual(out.recordedMissing, ['0007_x.sql', '0008_y.sql']);
+      assert.equal(out.state, 'NOT_ATTEMPTED');
+      assert.ok(out.errors[0].includes('0007_x.sql, 0008_y.sql'));
+      assert.equal(applyInvoked(f), false, 'underlying apply never ran');
+    });
+  }
+
+  it('unparseable status refuses apply', () => {
+    const f = fake({ pending: ['0002_b.sql'], mode: 'garbage' });
+    const { code, out } = run(f, 'apply', '0002_b.sql');
+    assert.deepEqual([code, out.outcome, out.state], [1, 'STATUS_UNPARSEABLE', 'NOT_ATTEMPTED']);
+    assert.equal(applyInvoked(f), false);
+  });
+
+  it('post-apply recorded-but-missing fails closed (no activation)', () => {
+    const f = fake({ pending: ['0002_b.sql'], mode: 'missing-after-apply' });
+    const { code, out } = run(f, 'apply', '0002_b.sql');
+    assert.equal(code, 1);
+    assert.equal(out.outcome, 'RECORDED_BUT_MISSING_AFTER_APPLY');
+    assert.deepEqual(out.recordedMissing, ['0099_newer.sql']);
+    assert.equal(out.ok, false);
+  });
+
+  it('Deploy: recorded-but-missing check precedes review, backup, apply, staging, stop and swap', () => {
+    const ps = stripPsComments(readFileSync(join(WINDOWS_DIR, 'Deploy-FiyatUcuzApi.ps1'), 'utf8'));
+    const pos = (needle) => {
+      // Last occurrence: helper functions (e.g. the rollback function) come first.
+      const i = ps.lastIndexOf(needle);
+      assert.ok(i >= 0, `missing ${needle}`);
+      return i;
+    };
+    const guard = pos('$recordedMissing.Count -gt 0');
+    assert.ok(pos("'migration', '--mode', 'status'") < guard);
+    for (const later of [
+      "'--mode', 'review'",
+      "'backup', '--pg-dump'",
+      "'--mode', 'apply'",
+      '-StopBeforeRename',
+      'Stop-FiyatUcuzApi -TimeoutSec',
+      'Invoke-ActivationSteps -Layout $layout -Target $releaseDir\n',
+    ]) {
+      assert.ok(guard < pos(later), `guard must precede ${later.trim()}`);
+    }
+  });
+
+  it('Activate records the verified identity before the migration status gate (review fix)', () => {
+    const ps = stripPsComments(readFileSync(join(WINDOWS_DIR, 'Deploy-FiyatUcuzApi.ps1'), 'utf8'));
+    const identityPatch = ps.indexOf("-PhaseName 'verify' -Result 'target seal verified'");
+    assert.ok(identityPatch > 0);
+    assert.ok(identityPatch < ps.lastIndexOf("'migration', '--mode', 'status'"));
+  });
+
+  it('rollback paths are independent of the migration gate', () => {
+    for (const f of [
+      'Rollback-FiyatUcuzApi.ps1',
+      'FiyatUcuz.Deploy.psm1',
+      'Test-FiyatUcuzPreflight.ps1',
+    ]) {
+      const ps = stripPsComments(readFileSync(join(WINDOWS_DIR, f), 'utf8'));
+      assert.ok(!/'migration'/.test(ps), `${f} must not run the migration gate`);
+    }
+    const deploy = stripPsComments(
+      readFileSync(join(WINDOWS_DIR, 'Deploy-FiyatUcuzApi.ps1'), 'utf8'),
+    );
+    const start = deploy.indexOf('function Invoke-AppRollback');
+    const body = deploy.slice(start, deploy.indexOf('\n}\n', start));
+    assert.ok(
+      body.length > 0 && !/migration/.test(body),
+      'automatic rollback does not call the migration gate',
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ADIM 15A-6A — G3 backup evidence
+// ---------------------------------------------------------------------------
+
+describe('G3 backup evidence', () => {
+  function tools(dir, version = 'ok') {
+    const dumpRecord = join(dir, 'dump.json');
+    const versionRecord = join(dir, 'version.json');
+    const pgDump = fakeExe(
+      dir,
+      'pg_dump',
+      `const fs = require('fs');
+if (process.argv.includes('--version')) {
+  fs.writeFileSync(${JSON.stringify(versionRecord)}, JSON.stringify({ argv: process.argv.slice(2), env: process.env }));
+  const v = ${JSON.stringify(version)};
+  if (v === 'fail') process.exit(3);
+  process.stdout.write(v === 'garbage' ? 'hello\\n' : 'pg_dump (PostgreSQL) 16.4\\n');
+  process.exit(0);
+}
+fs.writeFileSync(${JSON.stringify(dumpRecord)}, 'ran');
+fs.writeFileSync(process.argv[process.argv.indexOf('--file') + 1], 'PGDMP fake');`,
+    );
+    const pgRestore = fakeExe(dir, 'pg_restore', "process.stdout.write('; Archive created\\n');");
+    return { pgDump, pgRestore, dumpRecord, versionRecord };
+  }
+  const parentEnv = {
+    PATH: process.env.PATH,
+    DATABASE_URL: 'postgres://x:leak@h/d',
+    PGPASSWORD: 'parent-leak',
+  };
+
+  it('records database name, UTC timestamps and the exact pg_dump version; no credentials', () => {
+    const dir = freshDir('g3');
+    const t = tools(dir);
+    const r = runBackup({
+      ...t,
+      migrationEnv: env(goodMigrationEnv()),
+      outFile: join(dir, 'b.dump'),
+      parentEnv,
+    });
+    assert.equal(r.database, 'fiyatucuz');
+    assert.match(r.createdAt, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+    assert.match(r.completedAt, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+    assert.ok(Date.parse(r.createdAt) <= Date.parse(r.completedAt));
+    assert.deepEqual([r.pgDumpVersion, r.pgDumpMajor], ['pg_dump (PostgreSQL) 16.4', 16]);
+    const text = JSON.stringify(r);
+    for (const bad of [SECRET_PW, 'fiyatucuz_migrator', 'postgres://', '127.0.0.1', 'leak'])
+      assert.ok(!text.includes(bad), bad);
+    // The version probe got no credentials.
+    const probe = JSON.parse(readFileSync(t.versionRecord, 'utf8'));
+    assert.deepEqual(probe.argv, ['--version']);
+    for (const k of ['PGPASSWORD', 'PGUSER', 'PGDATABASE', 'PGHOST', 'DATABASE_URL'])
+      assert.equal(probe.env[k], undefined, k);
+  });
+
+  it('bare or relative tool names are refused before anything is spawned (review fix)', () => {
+    const dir = freshDir('g3');
+    const t = tools(dir);
+    const decoyDir = freshDir('decoy');
+    const marker = join(decoyDir, 'decoy-ran');
+    fakeExe(
+      decoyDir,
+      'pg_dump',
+      `require('fs').writeFileSync(${JSON.stringify(marker)}, 'x'); console.log('pg_dump (PostgreSQL) 99.0');`,
+    );
+    const decoyEnv = { ...parentEnv, PATH: `${decoyDir}:${process.env.PATH}` };
+    for (const [pgDump, pgRestore] of [
+      ['pg_dump', t.pgRestore],
+      ['./pg_dump', t.pgRestore],
+      [t.pgDump, 'pg_restore'],
+      ['', t.pgRestore],
+    ]) {
+      const outFile = join(dir, `b-${(counter += 1)}.dump`);
+      assert.throws(
+        () =>
+          runBackup({
+            pgDump,
+            pgRestore,
+            migrationEnv: env(goodMigrationEnv()),
+            outFile,
+            parentEnv: decoyEnv,
+          }),
+        (e) => e.code === 'BACKUP_FAILED' && /fully qualified path/.test(e.message),
+        `${pgDump} / ${pgRestore}`,
+      );
+      assert.equal(existsSync(outFile), false);
+    }
+    assert.throws(
+      () => probePgDumpVersion('pg_dump', { parentEnv: decoyEnv }),
+      /fully qualified path/,
+    );
+    assert.equal(existsSync(marker), false, 'decoy on PATH never ran');
+    assert.equal(existsSync(t.versionRecord), false, 'no probe ran');
+  });
+
+  it('Deploy gate requires full paths for -PgDump / -PgRestore before the backup step', () => {
+    const ps = stripPsComments(readFileSync(join(WINDOWS_DIR, 'Deploy-FiyatUcuzApi.ps1'), 'utf8'));
+    const check = ps.indexOf("$PgDump -notmatch '^[A-Za-z]:\\\\'");
+    assert.ok(check > 0);
+    assert.ok(check < ps.lastIndexOf("'backup', '--pg-dump'"));
+  });
+
+  it('uses the exact executable passed in, never a pg_dump on PATH', () => {
+    const dir = freshDir('g3');
+    const t = tools(dir);
+    const decoyDir = freshDir('decoy');
+    const marker = join(decoyDir, 'decoy-ran');
+    fakeExe(
+      decoyDir,
+      'pg_dump',
+      `require('fs').writeFileSync(${JSON.stringify(marker)}, 'x'); console.log('pg_dump (PostgreSQL) 99.0');`,
+    );
+    const r = runBackup({
+      ...t,
+      migrationEnv: env(goodMigrationEnv()),
+      outFile: join(dir, 'b.dump'),
+      parentEnv: { ...parentEnv, PATH: `${decoyDir}:${process.env.PATH}` },
+    });
+    assert.equal(r.pgDumpMajor, 16);
+    assert.equal(existsSync(marker), false);
+  });
+
+  for (const version of ['fail', 'garbage']) {
+    it(`version probe ${version} → BACKUP_FAILED and the dump never runs`, () => {
+      const dir = freshDir('g3');
+      const t = tools(dir, version);
+      const outFile = join(dir, 'b.dump');
+      assert.throws(
+        () => runBackup({ ...t, migrationEnv: env(goodMigrationEnv()), outFile, parentEnv }),
+        (e) =>
+          e.code === 'BACKUP_FAILED' &&
+          /backup not attempted/.test(e.message) &&
+          !e.message.includes(SECRET_PW),
+      );
+      assert.equal(existsSync(t.dumpRecord), false);
+      assert.equal(existsSync(outFile), false);
+    });
+  }
+
+  it('deploy-cli backup returns the new evidence without secrets', () => {
+    const dir = freshDir('g3');
+    const t = tools(dir);
+    const envFile = join(dir, 'migration.env');
+    writeFileSync(
+      envFile,
+      Object.entries(goodMigrationEnv())
+        .map(([k, v]) => `${k}=${v}`)
+        .join('\n'),
+    );
+    const res = spawnSync(
+      NODE,
+      [
+        DEPLOY_CLI,
+        'backup',
+        '--pg-dump',
+        t.pgDump,
+        '--pg-restore',
+        t.pgRestore,
+        '--env-file',
+        envFile,
+        '--out',
+        join(dir, 'b.dump'),
+      ],
+      { encoding: 'utf8' },
+    );
+    assert.equal(res.status, 0, res.stdout);
+    const b = JSON.parse(res.stdout).backup;
+    for (const k of [
+      'path',
+      'database',
+      'bytes',
+      'sha256',
+      'restoreListOk',
+      'createdAt',
+      'completedAt',
+      'pgDumpVersion',
+      'pgDumpMajor',
+    ]) {
+      assert.ok(k in b, k);
+    }
+    assert.ok(!res.stdout.includes(SECRET_PW) && !res.stdout.includes('fiyatucuz_migrator'));
   });
 });
 

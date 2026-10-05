@@ -859,6 +859,12 @@ export function verifySealedRelease({ releaseDir, sealPath, expectedSealSha256 }
   if (seal.schemaVersion !== SEAL_SCHEMA_VERSION || seal.kind !== SEAL_KIND)
     errors.push('unsupported seal');
   if (seal.releaseId !== basename(root)) errors.push('seal belongs to a different release');
+  // Identity must be well-formed: a missing manifest digest would otherwise
+  // silently skip the manifest binding below.
+  if (!/^[0-9a-f]{64}$/.test(String(seal.manifestSha256 ?? '')))
+    errors.push('seal manifest digest invalid');
+  if (!/^[0-9a-f]{40}$/.test(String(seal.gitCommit ?? ''))) errors.push('seal commit invalid');
+  if (errors.includes('seal manifest digest invalid')) return { ok: false, errors };
   const base = verifyRelease({
     releaseDir: root,
     stage: 'materialized',
@@ -880,5 +886,17 @@ export function verifySealedRelease({ releaseDir, sealPath, expectedSealSha256 }
       errors.push('node_modules changed since sealing');
     }
   }
-  return { ok: errors.length === 0, errors };
+  if (errors.length > 0) return { ok: false, errors };
+  // Only after every check passed: the identity read from the bytes verified
+  // above (seal text, and the manifest bound to it by its digest).
+  return {
+    ok: true,
+    errors: [],
+    identity: {
+      releaseId: seal.releaseId,
+      gitCommit: seal.gitCommit,
+      manifestSha256: seal.manifestSha256,
+      sealSha256: sha256Text(text),
+    },
+  };
 }

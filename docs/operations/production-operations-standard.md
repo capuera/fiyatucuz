@@ -73,24 +73,24 @@ The record is stored with the deployment receipts (`C:\FiyatUcuz\deployments\`) 
 
 Production deployments are based only on exact, immutable identifiers — never on "latest main" or "latest build".
 
-| Evidence                 | Requirement                                                                                               |
-| ------------------------ | --------------------------------------------------------------------------------------------------------- |
-| Git commit               | Full 40-character SHA                                                                                     |
-| Provenance               | Approver confirms the commit exists on `origin/main` (gap G13: not checked by tooling)                    |
-| Clean prepare            | `api-release.mjs prepare` ran on a clean tree at that commit                                              |
-| Manifest SHA-256         | Printed by `prepare`, recorded out of band                                                                |
-| Archive SHA-256          | Of the exact `.tgz` transferred                                                                           |
-| Seal SHA-256             | Printed by the Windows Prepare phase                                                                      |
-| Release ID               | `yyyymmdd-<first 12 hex of the commit>`                                                                   |
-| Tests / build            | Results recorded by the preparer for that commit (gap G5: current CI is not sufficient evidence)          |
-| Migration status         | Pending list from the read-only status; **no "recorded but missing from this checkout" entries** (gap G2) |
-| Migration classification | Class per file (§3) and the review (§6)                                                                   |
-| Known issues             | Listed with a disposition; no unresolved critical issue                                                   |
-| Backup readiness         | pg_dump / pg_restore paths and versions; pg_dump major version ≥ server version; free disk                |
-| 15A-7 evidence           | Reference to the accepted validation record (§12)                                                         |
-| Staging rehearsal        | Per-release rehearsal on Windows staging: required for B–D, recommended for A                             |
-| Rollback target          | Release ID of the current release (the tooling verifies its seal)                                         |
-| People and time          | Operator, PREPARED BY, REVIEWED/APPROVED BY, planned window                                               |
+| Evidence                 | Requirement                                                                                                                                             |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Git commit               | Full 40-character SHA                                                                                                                                   |
+| Provenance               | Approver confirms the commit exists on `origin/main` (gap G13: not checked by tooling)                                                                  |
+| Clean prepare            | `api-release.mjs prepare` ran on a clean tree at that commit                                                                                            |
+| Manifest SHA-256         | Printed by `prepare`, recorded out of band                                                                                                              |
+| Archive SHA-256          | Of the exact `.tgz` transferred                                                                                                                         |
+| Seal SHA-256             | Printed by the Windows Prepare phase                                                                                                                    |
+| Release ID               | `yyyymmdd-<first 12 hex of the commit>`                                                                                                                 |
+| Tests / build            | Results recorded by the preparer for that commit (gap G5: current CI is not sufficient evidence)                                                        |
+| Migration status         | Pending list from the read-only status; **no "recorded but missing from this checkout" entries** (normal Activate refuses them: `RECORDED_BUT_MISSING`) |
+| Migration classification | Class per file (§3) and the review (§6)                                                                                                                 |
+| Known issues             | Listed with a disposition; no unresolved critical issue                                                                                                 |
+| Backup readiness         | pg_dump / pg_restore paths and versions; pg_dump major version ≥ server version; free disk                                                              |
+| 15A-7 evidence           | Reference to the accepted validation record (§12)                                                                                                       |
+| Staging rehearsal        | Per-release rehearsal on Windows staging: required for B–D, recommended for A                                                                           |
+| Rollback target          | Release ID of the current release (the tooling verifies its seal)                                                                                       |
+| People and time          | Operator, PREPARED BY, REVIEWED/APPROVED BY, planned window                                                                                             |
 
 ## 6. Migration review standard
 
@@ -114,9 +114,7 @@ A CONTRACT migration never ships in the release that first introduces the new ap
 
 - **Any migration ⇒ a verified backup before the migration.** The tooling enforces this when migrations are pending.
 - Class A deployments do not require a deployment backup; platform backup (WAL / point-in-time recovery) is a separate, open item in `.fiyatucuz/SECURITY.md` §14.
-- **Evidence** recorded in the receipt or approval record (no secret values):
-  - path, bytes, SHA-256, `pg_restore --list` success (recorded by the tooling);
-  - timestamp, database identity (expected database name), pg_dump version (gap G3: to be added to the tooling; until then recorded manually).
+- **Evidence**, recorded by the tooling in the receipt's `backup` section (no secret values): path, database **name** only (from the validated migration configuration; never a URL, user or password), bytes, SHA-256, `pg_restore --list` success, `createdAt` (UTC, immediately before `pg_dump`), `completedAt` (UTC, after `pg_restore --list`), and the version of the exact `pg_dump` executable used (`pgDumpVersion`, `pgDumpMajor`). If that executable's `--version` fails or is not recognized, no backup and no migration run.
 - **Storage**: `C:\FiyatUcuz\staging\db-backups`, Administrators/SYSTEM only. A dump contains personal data and password hashes: never copied off the host unencrypted, never put in Git, tickets, chat or shared folders.
 - **Retention**: §10.
 - A restore drill against a **non-production** database is part of 15A-7.
@@ -208,7 +206,7 @@ ADR-0021 stays **proposed** until a dated 15A-7 record on Windows staging (non-p
 | Backup                | real `pg_dump` / `pg_restore --list` against the non-production DB; restore drill              |
 | Migrations            | status, apply, lock-busy and wrong-DB cases against the non-production DB                      |
 | Receipts              | receipts of all runs above, checked for secrets                                                |
-| Tooling follow-ups    | G1, G2, G3 fixed and covered (§16)                                                             |
+| Tooling follow-ups    | G1, G2, G3 (code-resolved in 15A-6A, §16) behave as specified on Windows                       |
 
 ## 13. Post-deployment verification
 
@@ -217,7 +215,7 @@ Required after every production deployment (commands in the [checklist](producti
 1. `FiyatUcuzApi` is Running.
 2. Local `http://127.0.0.1:4000/health` returns 200 with `{"status":"ok"}`.
 3. The only listener on port 4000 is `127.0.0.1:4000`.
-4. Migration status: nothing pending and nothing "recorded but missing from this checkout".
+4. Migration status: nothing pending and nothing "recorded but missing from this checkout". (After `ROLLED_BACK_APP_ONLY` the restored, older release legitimately shows recorded-but-missing migrations — see [incident-recovery.md](incident-recovery.md#rolled_back_app_only).)
 5. The receipt's final status is `COMPLETED`.
 6. `current` points to the approved release ID.
 7. The seal of the active release verifies.
@@ -251,13 +249,13 @@ Only the `FiyatUcuzApi` service may be controlled by FiyatUcuz deployment. Never
 
 ## 16. Known tooling gaps
 
-Mandatory before the 15A-7 rehearsal (tooling changes, separate step):
+Code-resolved in ADIM 15A-6A — still to be proven on Windows staging (15A-7):
 
-| Gap    | Description                                                                                                                                                                                                                                      |
-| ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| **G1** | The deployment receipt does not reliably preserve `gitCommit` / manifest identity (Activate records them as `null`; the seal holds them).                                                                                                        |
-| **G2** | **Blocker before 15A-7.** "Recorded but missing from this checkout" migrations are not enforced by the deployment parser, so an older release could be activated on a newer schema. Until fixed, the operator checks the status output manually. |
-| **G3** | Backup evidence needs database identity, `createdAt` and pg_dump version.                                                                                                                                                                        |
+| Gap    | Resolution                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| ------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **G1** | Receipt identity (`release.id`, `gitCommit`, `manifestSha256`, `sealSha256`) comes only from verified data — Prepare's own hashes and the verified seal — and is write-once: a missing value never erases it, a different value fails closed (`RECEIPT_IDENTITY_CONFLICT`). Operator inputs are kept separately under `requested`. `archiveSha256` is Prepare evidence; Activate leaves it `null` (the Prepare and Activate receipts link via release ID + manifest SHA-256). |
+| **G2** | The status parser is strict (unrecognized output → `STATUS_UNPARSEABLE`) and reports recorded-but-missing migrations separately. Normal Activate refuses them (`RECORDED_BUT_MISSING`) before review, backup, migration, service stop and any junction change. Rollback paths do not run this check.                                                                                                                                                                          |
+| **G3** | Backup evidence includes database name, `createdAt`, `completedAt`, `pgDumpVersion` and `pgDumpMajor` (§7).                                                                                                                                                                                                                                                                                                                                                                   |
 
 Recorded, handled by policy for now:
 

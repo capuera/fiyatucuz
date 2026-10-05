@@ -40,7 +40,7 @@ Get-ChildItem -LiteralPath C:\FiyatUcuz\logs\api | Sort-Object LastWriteTime -De
 Get-Content -LiteralPath C:\FiyatUcuz\logs\api\<LOG_FILE> -Tail 200
 ```
 
-Migration status (read-only, no lock) — see the [checklist](production-deployment-checklist.md#read-only-verification-commands) for the exact command and the `Test-Path Env:DATABASE_MIGRATION_URL` precondition.
+Migration status (read-only, no lock) — see the [checklist](production-deployment-checklist.md#read-only-verification-commands) for the exact command.
 
 **Preserve, never delete or edit:** the receipt(s), `C:\FiyatUcuz\staging\work\snapshots\*`, `C:\FiyatUcuz\logs\api\*`, the release directories involved and their seals, the deployment backup in `C:\FiyatUcuz\staging\db-backups\`. Copies for analysis stay on the server or in an access-controlled location; never attach logs or receipts containing connection details to tickets or chat.
 
@@ -51,6 +51,7 @@ Migration status (read-only, no lock) — see the [checklist](production-deploym
 Stopped before any production change; the database may still be checked to confirm.
 
 - **MAY:** read the receipt for the failed check; fix the cause (e.g. disk, ACL, env policy, wrong seal digest); start a new deployment with a new approval record.
+- **If the cause is `RECORDED_BUT_MISSING`:** the database records migrations this release does not contain (the release is older than the schema). Build a fix-forward release that contains every recorded migration file. Never edit or delete tracking rows, never write a down-migration.
 - **MUST NOT:** bypass or edit the gate; reuse an approval record whose identifiers changed.
 - **PRESERVE:** receipt, preflight output, snapshots.
 
@@ -75,6 +76,7 @@ Activation failed and the previous release is serving again; the database is unc
 The previous application is serving again; **DB NOT ROLLED BACK** — migrations of the failed deployment remain applied.
 
 - **MAY:** confirm the restored release works with the new schema (post-deployment checks plus a database-reading smoke test); plan a fix-forward release.
+- **EXPECTED:** the migration status of the restored release reports `RECORDED_BUT_MISSING` with the failed deployment's migration IDs — the restored release is older than the schema. The next normal deployment must be a **fix-forward** release containing every migration file recorded in the database; Activate refuses anything older.
 - **MUST NOT:** call this a full rollback; restore the database without an approved data-loss assessment; remove the applied migrations by hand.
 - **PRESERVE:** receipt (including the DB note), the pre-migration backup (extended retention), logs, the failed release.
 

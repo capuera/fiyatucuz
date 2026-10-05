@@ -98,10 +98,37 @@ function Assert-ExitOk {
     }
 }
 
+# Seal verification that also returns the identity read from the verified
+# seal and manifest (G1). Throws when verification fails or identity is
+# incomplete; operator arguments are never used as identity.
+function Get-VerifiedIdentity {
+    param([string]$Dir, [string]$ExpectedSha)
+    $a = @($layout.DeployCli, 'release-identity', '--release', $Dir, '--seal', "$Dir.seal.json")
+    if ($ExpectedSha) { $a += @('--seal-sha256', $ExpectedSha) }
+    $r = Invoke-Cli -Arguments $a
+    $identity = Get-OptionalProperty -Object $r.Result -Name 'identity'
+    if ($r.ExitCode -ne 0 -or $null -eq $identity) { throw "seal verification failed for $(Split-Path -Leaf $Dir)" }
+    foreach ($f in @('releaseId', 'gitCommit', 'manifestSha256', 'sealSha256')) {
+        if (-not [string](Get-OptionalProperty -Object $identity -Name $f)) { throw "verified identity incomplete ($f)" }
+    }
+    return $identity
+}
+
+# Receipt release section from a verified identity. archiveSha256 is not part
+# of it: only Prepare records the archive hash it computed itself.
+function ConvertTo-ReleasePatch {
+    param([object]$Identity)
+    return @{
+        id = [string]$Identity.releaseId; gitCommit = [string]$Identity.gitCommit
+        manifestSha256 = [string]$Identity.manifestSha256; sealSha256 = [string]$Identity.sealSha256; verifiedBy = 'seal'
+    }
+}
+
 # --- receipt BEFORE the first mutation -----------------------------------------
 $init = @{
     deploymentId = $deploymentId; host = $env:COMPUTERNAME; operator = $env:USERNAME
-    releaseId = $ReleaseId; gitCommit = $null; archiveSha256 = $ArchiveSha256; manifestSha256 = $ManifestSha256
+    # Operator inputs: stored as receipt.requested, never as verified identity.
+    releaseId = $ReleaseId; archiveSha256 = $ArchiveSha256; manifestSha256 = $ManifestSha256; sealSha256 = $SealSha256
     tool = @{ phase = $Phase }
 }
 $initFile = Save-FiyatUcuzJson -Layout $layout -Value $init -Name 'receipt-init'
@@ -123,6 +150,8 @@ if ($Phase -eq 'Prepare') {
         Copy-Item -LiteralPath $Archive -Destination $workArchive
         $actual = (Get-FileHash -LiteralPath $workArchive -Algorithm SHA256).Hash.ToLowerInvariant()
         if ($actual -ne $ArchiveSha256.ToLowerInvariant()) { throw 'archive SHA-256 mismatch' }
+        # The hash Prepare computed itself (and matched against the input).
+        Update-Receipt -Patch @{ release = @{ archiveSha256 = $actual; verifiedBy = 'prepare' } } -PhaseName 'archive' -Result 'archive hash verified'
 
         # Validate the listing BEFORE anything is extracted.
         $names = @(& $layout.Tar -tf $workArchive); if ($LASTEXITCODE -ne 0) { throw 'tar listing failed' }
@@ -155,7 +184,10 @@ if ($Phase -eq 'Prepare') {
         Assert-ExitOk -What 'runtime versions' -Result (Invoke-Cli -Arguments @($layout.DeployCli, 'check-runtime', '--manifest', $manifestFile, '--node-version', $nodeVersion, '--pnpm-version', $pnpmVersion))
         Assert-ExitOk -What 'free disk' -Result (Invoke-Cli -Arguments @($layout.DeployCli, 'check-disk', '--free-bytes', [string](Get-FreeBytes -Root $layout.Root)))
 
-        Update-Receipt -Patch @{ release = @{ id = $newReleaseId; gitCommit = $null; archiveSha256 = $ArchiveSha256; manifestSha256 = $ManifestSha256; sealSha256 = $null } } -PhaseName 'source' -Result 'verified'
+        # Digest Prepare computes itself from the manifest the source verify just
+        # accepted (equal to -ManifestSha256 by that check); id derived from it.
+        $manifestDigest = (Get-FileHash -LiteralPath $manifestFile -Algorithm SHA256).Hash.ToLowerInvariant()
+        Update-Receipt -Patch @{ release = @{ id = $newReleaseId; manifestSha256 = $manifestDigest; verifiedBy = 'prepare' } } -PhaseName 'source' -Result 'verified'
 
         # FINAL path from here on: never rename or move $releaseDir.
         Copy-Item -LiteralPath $workDir -Destination $releaseDir -Recurse
@@ -182,7 +214,10 @@ if ($Phase -eq 'Prepare') {
         Assert-ExitOk -What 'seal' -Result $seal
         if (-not (($seal.Lines -join "`n") -match 'seal sha256: ([0-9a-f]{64})')) { throw 'seal digest not reported' }
         $sealSha = $Matches[1]
-        Update-Receipt -Patch @{ status = 'PREPARED'; release = @{ id = $newReleaseId; archiveSha256 = $ArchiveSha256; manifestSha256 = $ManifestSha256; sealSha256 = $sealSha } } -PhaseName 'seal' -Result 'sealed'
+        # Re-verify the new seal and take identity (incl. gitCommit) from it; the
+        # write-once receipt refuses any value that differs from the earlier steps.
+        $identity = Get-VerifiedIdentity -Dir $releaseDir -ExpectedSha $sealSha
+        Update-Receipt -Patch @{ status = 'PREPARED'; release = (ConvertTo-ReleasePatch -Identity $identity) } -PhaseName 'seal' -Result 'sealed'
         Write-Output "PREPARED release $newReleaseId (seal sha256 $sealSha). Production is unchanged."
         exit 0
     } catch {
@@ -259,7 +294,10 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'preflight failed' }
     Assert-FiyatUcuzService -Layout $layout | Out-Null
 
-    if (-not (Test-Sealed -Dir $releaseDir -ExpectedSha $SealSha256)) { throw 'target release failed seal verification' }
+    $identity = Get-VerifiedIdentity -Dir $releaseDir -ExpectedSha $SealSha256
+    if ([string]$identity.releaseId -cne $ReleaseId) { throw 'verified release id differs from -ReleaseId' }
+    # Record the verified identity at once, so a later gate failure still has it.
+    Update-Receipt -Patch @{ release = (ConvertTo-ReleasePatch -Identity $identity) } -PhaseName 'verify' -Result 'target seal verified'
 
     $pre = Test-ActivationPrecheck -Layout $layout -Target $releaseDir
     Assert-ExitOk -What 'activation junction precheck' -Result $pre
@@ -269,12 +307,26 @@ try {
     if (-not (Test-Sealed -Dir $previous -ExpectedSha $null)) { throw 'current (rollback target) release failed seal verification' }
 
     $statusRun = Invoke-Cli -Arguments @($layout.DeployCli, 'migration', '--mode', 'status', '--node', $layout.Node, '--cli', $migrateCli, '--env-file', $layout.MigrationEnv)
+    # G2: the database records migrations this release does not contain (the
+    # release is older than the schema). NO-GO before review, backup, apply,
+    # service stop and any junction change. Fix-forward only.
+    $recordedMissing = @(Get-OptionalProperty -Object $statusRun.Result -Name 'recordedMissing' | Where-Object { $_ })
+    if ($recordedMissing.Count -gt 0) {
+        $null = Write-ReceiptBestEffort -Patch @{ migrations = @{
+                state = 'NOT_ATTEMPTED'; attempted = $false; outcome = 'RECORDED_BUT_MISSING'; knownApplied = @()
+                recordedMissing = $recordedMissing; before = $statusRun.Result; after = $null; reviewed = $ReviewedMigrations
+            }
+        } -PhaseName 'precheck' -Result 'recorded-but-missing migrations'
+        throw "database records migrations missing from this release: $($recordedMissing -join ', ') (a fix-forward release containing them is required)"
+    }
     Assert-ExitOk -What "migration status ($(Get-OptionalProperty -Object $statusRun.Result -Name 'outcome'))" -Result $statusRun
     $pending = @(Get-OptionalProperty -Object $statusRun.Result -Name 'pending' | Where-Object { $_ })
     if ($pending.Count -gt 0) {
         if ($ReviewedMigrations.Count -eq 0) { throw "pending migrations must be reviewed and listed in -ReviewedMigrations: $($pending -join ', ')" }
         if (-not $PgDump -or -not (Test-Path -LiteralPath $PgDump -PathType Leaf)) { throw 'pending migrations require -PgDump (existing file) for the mandatory backup' }
         if (-not $PgRestore -or -not (Test-Path -LiteralPath $PgRestore -PathType Leaf)) { throw 'pending migrations require -PgRestore (existing file)' }
+        # Full paths only: the same file must be checked here and executed by Node.
+        if ($PgDump -notmatch '^[A-Za-z]:\\' -or $PgRestore -notmatch '^[A-Za-z]:\\') { throw '-PgDump and -PgRestore must be full paths (drive letter)' }
         $review = Invoke-Cli -Arguments @($layout.DeployCli, 'migration', '--mode', 'review', '--node', $layout.Node, '--cli', $migrateCli,
             '--env-file', $layout.MigrationEnv, '--reviewed', ($ReviewedMigrations -join ','))
         Assert-ExitOk -What 'migration review gate' -Result $review
@@ -284,7 +336,7 @@ try {
     }
 
     Update-Receipt -Patch @{
-        release = @{ id = $ReleaseId; gitCommit = $null; archiveSha256 = $null; manifestSha256 = $null; sealSha256 = $SealSha256 }
+        release = (ConvertTo-ReleasePatch -Identity $identity)
         previousRelease = $previous; junctions = @{ before = (Get-ActivationSnapshot -Layout $layout) }
         service = @{ before = (Get-FiyatUcuzServiceStatus) }
         migrations = @{ state = $script:MigrationState; attempted = $false; outcome = $null; knownApplied = @(); before = $statusRun.Result; after = $null; reviewed = $ReviewedMigrations }
@@ -336,7 +388,10 @@ if ($pending.Count -gt 0) {
 
 # --- 3. re-verify immediately before activation, then stage current.next -------
 try {
-    if (-not (Test-Sealed -Dir $releaseDir -ExpectedSha $SealSha256)) { throw 'release seal changed before activation' }
+    $again = Get-VerifiedIdentity -Dir $releaseDir -ExpectedSha $SealSha256
+    if ([string]$again.gitCommit -cne [string]$identity.gitCommit -or [string]$again.manifestSha256 -cne [string]$identity.manifestSha256) {
+        throw 'release identity changed before activation'
+    }
     Assert-ExitOk -What 'activation junction re-check' -Result (Test-ActivationPrecheck -Layout $layout -Target $releaseDir)
 } catch {
     Stop-Activation -FailedPhase 'precheck' -Reason $_.Exception.Message
